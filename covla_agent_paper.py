@@ -626,6 +626,8 @@ class CoVLAAgentPaper(nn.Module):
         attention_mask = torch.ones(batch_size, combined_embeds.shape[1], device=device)
         
         # 5. Generate using HuggingFace generate() with inputs_embeds
+        prefix_length = combined_embeds.shape[1]
+        
         outputs = self.language_model.generate(
             inputs_embeds=combined_embeds,
             attention_mask=attention_mask,
@@ -635,8 +637,11 @@ class CoVLAAgentPaper(nn.Module):
             eos_token_id=self.tokenizer.eos_token_id,
         )
         
-        # 6. Decode generated tokens
-        captions = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        # 6. Decode ONLY the newly generated tokens (skip prefix positions)
+        # When using inputs_embeds, output includes placeholder tokens for prefix
+        # which decode to garbage (numbers). Only decode new tokens.
+        new_tokens = outputs[:, prefix_length:]
+        captions = self.tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
         
         # Clean up
         captions = [cap.strip() if cap.strip() else "The vehicle is driving on a road." for cap in captions]
@@ -791,6 +796,7 @@ class CoVLATrainerPaper:
         total_traj_loss = 0
         total_caption_loss = 0
         n_batches = 0
+        global_step = getattr(self, '_global_step', -1)
         
         for batch in dataloader:
             images = batch['image'].to(self.device)
@@ -829,12 +835,103 @@ class CoVLATrainerPaper:
             total_traj_loss += output.get('trajectory_loss', torch.tensor(0)).item()
             total_caption_loss += output.get('caption_loss', torch.tensor(0)).item()
             n_batches += 1
+            global_step += 1
+            
+            # Visualize every 500 steps (change to smaller number for debugging)
+            if global_step % 500 == 0:
+                self._visualize_training_sample(batch, output, global_step)
+        
+        self._global_step = global_step
         
         return {
             'loss': total_loss / n_batches,
             'trajectory_loss': total_traj_loss / n_batches,
             'caption_loss': total_caption_loss / n_batches,
         }
+    
+    def _visualize_training_sample(self, batch, output, step):
+        """Visualize a training sample (first item in batch)."""
+        import matplotlib.pyplot as plt
+        
+        # Clear previous visualization only, then reprint epoch summaries
+        try:
+            from IPython.display import clear_output
+            clear_output(wait=True)
+            
+            # Reprint epoch summaries if any exist
+            if hasattr(self, '_epoch_summaries') and self._epoch_summaries:
+                header = f"{'Epoch':<8}{'Train Loss':<12}{'Val Loss':<12}{'ADE':<10}{'FDE':<10}"
+                print(header)
+                print("-" * len(header))
+                for summary in self._epoch_summaries:
+                    print(summary)
+                print()
+        except ImportError:
+            pass
+        
+        self.model.eval()
+        
+        # Get first sample from batch
+        gt_traj = batch['trajectory'][0].cpu().numpy()
+        pred_traj = output['pred_trajectory'][0].detach().cpu().numpy()
+        speed = batch['speed'][0].item()
+        caption = batch['caption'][0] if isinstance(batch['caption'], list) else batch['caption']
+        
+        # Get matrices - DataLoader collates as [row][col][batch_idx]
+        extrinsic = np.array([[col[0].item() for col in row] for row in batch['extrinsic_matrix']])
+        intrinsic = np.array([[col[0].item() for col in row] for row in batch['intrinsic_matrix']])
+        
+        # Load original image from path
+        image_path = batch['image_path'][0] if isinstance(batch['image_path'], list) else batch['image_path']
+        if os.path.exists(image_path):
+            frame = np.array(Image.open(image_path).convert('RGB'))
+        else:
+            image = batch['image'][0]
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            frame = ((image.cpu() * std + mean).clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        
+        # Compute metrics
+        ade = np.mean(np.linalg.norm(pred_traj - gt_traj, axis=1))
+        fde = np.linalg.norm(pred_traj[-1] - gt_traj[-1])
+        
+        # Generate predicted caption
+        with torch.no_grad():
+            image_tensor = batch['image'][0:1].to(self.device)
+            speed_tensor = batch['speed'][0:1].to(self.device)
+            pred_caption = self.model.generate_caption(image_tensor, speed_tensor)[0]
+        
+        # Create figure
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Left: Image with trajectory
+        ax1 = axes[0]
+        plot_trajectory_on_image(frame, gt_traj, extrinsic, intrinsic, color='green', label='GT', ax=ax1)
+        plot_trajectory_on_image(frame, pred_traj, extrinsic, intrinsic, color='red', label='Pred', ax=ax1)
+        ax1.legend(loc='upper right')
+        ax1.set_title(f"Step {step} | ADE: {ade:.2f}m | FDE: {fde:.2f}m | Speed: {speed:.1f} m/s")
+        
+        # Right: Bird's eye view
+        ax2 = axes[1]
+        ax2.plot(gt_traj[:, 0], gt_traj[:, 1], 'g-o', markersize=5, label='GT')
+        ax2.plot(pred_traj[:, 0], pred_traj[:, 1], 'r-o', markersize=5, label='Pred')
+        ax2.scatter([0], [0], c='blue', s=100, marker='*', label='Ego', zorder=5)
+        ax2.set_xlabel('Forward (m)')
+        ax2.set_ylabel('Lateral (m)')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        ax2.set_aspect('equal')
+        ax2.set_title("Bird's Eye View")
+        
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
+        
+        # Print captions
+        print(f"📝 GT:   {caption[:300]}...")
+        print(f"🤖 Pred: {pred_caption[:300]}...")
+        
+        self.model.train()
     
     @torch.no_grad()
     def evaluate(self, dataloader: DataLoader) -> Dict[str, float]:
@@ -914,6 +1011,7 @@ class CoVLATrainerPaper:
         print("-" * len(header))
         
         best_ade = float('inf')
+        self._epoch_summaries = []  # Store for reprinting after clear_output
         
         for epoch in range(num_epochs):
             # Train
@@ -927,15 +1025,19 @@ class CoVLATrainerPaper:
                 self.history['val_ade'].append(val_metrics['ade'])
                 self.history['val_fde'].append(val_metrics['fde'])
                 
-                print(f"{epoch+1:<8}{train_metrics['loss']:<12.4f}{val_metrics['loss']:<12.4f}"
-                      f"{val_metrics['ade']:<10.3f}{val_metrics['fde']:<10.3f}")
+                summary = (f"{epoch+1:<8}{train_metrics['loss']:<12.4f}{val_metrics['loss']:<12.4f}"
+                          f"{val_metrics['ade']:<10.3f}{val_metrics['fde']:<10.3f}")
+                print(summary)
+                self._epoch_summaries.append(summary)
                 
                 # Save best model
                 if val_metrics['ade'] < best_ade:
                     best_ade = val_metrics['ade']
                     self.model.save_trainable("covla_best.pt")
             else:
-                print(f"{epoch+1:<8}{train_metrics['loss']:<12.4f}")
+                summary = f"{epoch+1:<8}{train_metrics['loss']:<12.4f}"
+                print(summary)
+                self._epoch_summaries.append(summary)
             
             # Save checkpoint each epoch
             self.model.save_trainable(f"covla_epoch_{epoch+1}.pt")
@@ -1049,8 +1151,8 @@ def plot_trajectory_on_image(
     ax.imshow(frame)
     if len(traj_image) > 0:
         ax.plot(traj_image[:, 0], traj_image[:, 1], 
-               marker='o', color=color, linestyle='solid', 
-               linewidth=2, markersize=4, alpha=0.8, label=label)
+               marker='o', color=color, linestyle='-', 
+               linewidth=3, markersize=8, alpha=0.9, label=label)
     ax.axis('off')
     
     return ax
