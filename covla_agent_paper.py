@@ -83,6 +83,7 @@ class CoVLAConfig:
     # Loss weights (paper: equally weighted)
     caption_weight: float = 0.5
     trajectory_weight: float = 0.5
+    smoothing_weight: float = 0.1  # Smoothing loss to reduce trajectory wobble
     
     # Data split (paper: 70/15/15)
     train_ratio: float = 0.70
@@ -339,6 +340,9 @@ class CoVLAAgentPaper(nn.Module):
             coord_dim=config.trajectory_dim,
         )
         
+        # Loss weights
+        self.smoothing_weight = config.smoothing_weight
+        
         # Print model info
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -559,6 +563,12 @@ class CoVLAAgentPaper(nn.Module):
             trajectory_loss = F.mse_loss(pred_trajectory, trajectories)
             result['trajectory_loss'] = trajectory_loss
             
+            # Smoothing loss: L2 penalty on acceleration (standard in trajectory prediction)
+            pred_velocity = pred_trajectory[:, 1:, :] - pred_trajectory[:, :-1, :]  # (B, 9, 3)
+            pred_accel = pred_velocity[:, 1:, :] - pred_velocity[:, :-1, :]  # (B, 8, 3)
+            smoothing_loss = torch.mean(pred_accel ** 2)
+            result['smoothing_loss'] = smoothing_loss
+            
             # Task 1: Caption Generation (Cross-Entropy loss)
             # Use outputs from same forward pass (captions are GT during training)
             logits = outputs.logits
@@ -574,10 +584,11 @@ class CoVLAAgentPaper(nn.Module):
             )
             result['caption_loss'] = caption_loss
             
-            # Combined loss (paper: equally weighted)
+            # Combined loss (paper: equally weighted + smoothing)
             result['loss'] = (
                 self.config.caption_weight * caption_loss +
-                self.config.trajectory_weight * trajectory_loss
+                self.config.trajectory_weight * trajectory_loss +
+                self.smoothing_weight * smoothing_loss
             )
         
         return result
@@ -609,20 +620,18 @@ class CoVLAAgentPaper(nn.Module):
         # 2. Add speed embedding (layer is float32, convert output to dtype)
         speed_embeds = self.speed_embedding(speeds.unsqueeze(-1).float().to(device))  # (B, llm_dim)
         speed_embeds = speed_embeds.to(dtype).unsqueeze(1)  # (B, 1, llm_dim)
-        prefix_embeds = torch.cat([vision_embeds, speed_embeds], dim=1)
         
-        # 3. Create prompt for generation
-        prompt = "Describe the driving scene: "
+        # 3. Use SAME prompt as training (must match forward())
+        prompt = "USER: <image> Describe the traffic scene. ASSISTANT: "
         prompt_inputs = self.tokenizer(
             [prompt] * batch_size,
             return_tensors="pt",
             padding=True,
-            add_special_tokens=True,
         ).to(device)
         prompt_embeds = self.language_model.get_input_embeddings()(prompt_inputs.input_ids).to(dtype)
         
-        # 4. Combine: [Vision] + [Speed] + [Prompt]
-        combined_embeds = torch.cat([prefix_embeds, prompt_embeds], dim=1)
+        # 4. Combine: [Vision] + [Speed] + [Prompt] (matches training)
+        combined_embeds = torch.cat([vision_embeds, speed_embeds, prompt_embeds], dim=1)
         attention_mask = torch.ones(batch_size, combined_embeds.shape[1], device=device)
         
         # 5. Generate using HuggingFace generate() with inputs_embeds
@@ -637,14 +646,15 @@ class CoVLAAgentPaper(nn.Module):
             eos_token_id=self.tokenizer.eos_token_id,
         )
         
-        # 6. Decode ONLY the newly generated tokens (skip prefix positions)
-        # When using inputs_embeds, output includes placeholder tokens for prefix
-        # which decode to garbage (numbers). Only decode new tokens.
-        new_tokens = outputs[:, prefix_length:]
-        captions = self.tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
+        # DEBUG: Uncomment to debug token generation
+        # print(f"DEBUG: prefix_length={prefix_length}, outputs.shape={outputs.shape}")
+        # print(f"DEBUG: first 10 tokens: {outputs[0, :10].tolist()}")
+        
+        # 6. Decode tokens
+        captions = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
         
         # Clean up
-        captions = [cap.strip() if cap.strip() else "The vehicle is driving on a road." for cap in captions]
+        captions = [cap.strip() for cap in captions]
         
         return captions
     
@@ -795,6 +805,7 @@ class CoVLATrainerPaper:
         total_loss = 0
         total_traj_loss = 0
         total_caption_loss = 0
+        total_smooth_loss = 0
         n_batches = 0
         global_step = getattr(self, '_global_step', -1)
         
@@ -834,6 +845,7 @@ class CoVLATrainerPaper:
             total_loss += loss.item()
             total_traj_loss += output.get('trajectory_loss', torch.tensor(0)).item()
             total_caption_loss += output.get('caption_loss', torch.tensor(0)).item()
+            total_smooth_loss += output.get('smoothing_loss', torch.tensor(0)).item()
             n_batches += 1
             global_step += 1
             
@@ -847,6 +859,7 @@ class CoVLATrainerPaper:
             'loss': total_loss / n_batches,
             'trajectory_loss': total_traj_loss / n_batches,
             'caption_loss': total_caption_loss / n_batches,
+            'smoothing_loss': total_smooth_loss / n_batches,
         }
     
     def _visualize_training_sample(self, batch, output, step):
@@ -858,11 +871,16 @@ class CoVLATrainerPaper:
             from IPython.display import clear_output
             clear_output(wait=True)
             
-            # Reprint epoch summaries if any exist
+            # Reprint training info and epoch summaries
+            if hasattr(self, '_training_info'):
+                for line in self._training_info:
+                    print(line)
+            
+            if hasattr(self, '_header'):
+                print(self._header)
+                print("-" * len(self._header))
+            
             if hasattr(self, '_epoch_summaries') and self._epoch_summaries:
-                header = f"{'Epoch':<8}{'Train Loss':<12}{'Val Loss':<12}{'ADE':<10}{'FDE':<10}"
-                print(header)
-                print("-" * len(header))
                 for summary in self._epoch_summaries:
                     print(summary)
                 print()
@@ -995,18 +1013,27 @@ class CoVLATrainerPaper:
                 shuffle=False,
             )
         
-        print("\n" + "=" * 70)
-        print("Training CoVLA-Agent (Paper Implementation)")
-        print("=" * 70)
-        print(f"Train samples: {len(train_dataset)}")
-        if val_dataset:
-            print(f"Val samples: {len(val_dataset)}")
-        print(f"Epochs: {num_epochs}")
-        print(f"Batch size: {self.config.batch_size}")
-        print(f"Loss weights: caption={self.config.caption_weight}, trajectory={self.config.trajectory_weight}")
-        print("=" * 70 + "\n")
+        # Store training info for reprinting after clear_output
+        self._training_info = [
+            "",
+            "=" * 70,
+            "Training CoVLA-Agent (Paper Implementation)",
+            "=" * 70,
+            f"Train samples: {len(train_dataset)}",
+            f"Val samples: {len(val_dataset)}" if val_dataset else None,
+            f"Epochs: {num_epochs}",
+            f"Batch size: {self.config.batch_size}",
+            f"Loss weights: caption={self.config.caption_weight}, trajectory={self.config.trajectory_weight}",
+            "=" * 70,
+            "",
+        ]
+        self._training_info = [line for line in self._training_info if line is not None]
         
-        header = f"{'Epoch':<8}{'Train Loss':<12}{'Val Loss':<12}{'ADE':<10}{'FDE':<10}"
+        for line in self._training_info:
+            print(line)
+        
+        header = f"{'Epoch':<6}{'Loss':<10}{'Traj':<10}{'Cap':<10}{'Smooth':<10}{'Val':<10}{'ADE':<8}{'FDE':<8}"
+        self._header = header
         print(header)
         print("-" * len(header))
         
@@ -1025,8 +1052,12 @@ class CoVLATrainerPaper:
                 self.history['val_ade'].append(val_metrics['ade'])
                 self.history['val_fde'].append(val_metrics['fde'])
                 
-                summary = (f"{epoch+1:<8}{train_metrics['loss']:<12.4f}{val_metrics['loss']:<12.4f}"
-                          f"{val_metrics['ade']:<10.3f}{val_metrics['fde']:<10.3f}")
+                summary = (f"{epoch+1:<6}{train_metrics['loss']:<10.4f}"
+                          f"{train_metrics['trajectory_loss']:<10.4f}"
+                          f"{train_metrics['caption_loss']:<10.4f}"
+                          f"{train_metrics['smoothing_loss']:<10.4f}"
+                          f"{val_metrics['loss']:<10.4f}"
+                          f"{val_metrics['ade']:<8.3f}{val_metrics['fde']:<8.3f}")
                 print(summary)
                 self._epoch_summaries.append(summary)
                 
@@ -1035,7 +1066,10 @@ class CoVLATrainerPaper:
                     best_ade = val_metrics['ade']
                     self.model.save_trainable("covla_best.pt")
             else:
-                summary = f"{epoch+1:<8}{train_metrics['loss']:<12.4f}"
+                summary = (f"{epoch+1:<6}{train_metrics['loss']:<10.4f}"
+                          f"{train_metrics['trajectory_loss']:<10.4f}"
+                          f"{train_metrics['caption_loss']:<10.4f}"
+                          f"{train_metrics['smoothing_loss']:<10.4f}")
                 print(summary)
                 self._epoch_summaries.append(summary)
             
@@ -1607,14 +1641,14 @@ def generate_eval_images(
     show_gt: bool = True,
 ):
     """
-    Generate evaluation images with trajectory overlay.
+    Generate evaluation images with trajectory overlay + bird's eye view + captions.
     
     Usage:
         generate_eval_images(model, val_dataset, "eval", num_frames=30)
     
     Output: eval/0000.png, eval/0001.png, ...
     """
-    import cv2
+    import matplotlib.pyplot as plt
     from tqdm import tqdm
     
     os.makedirs(output_dir, exist_ok=True)
@@ -1625,35 +1659,52 @@ def generate_eval_images(
     metrics = []
     
     for i in tqdm(range(start_idx, end_idx), desc="Processing"):
-        r = _predict_sample(model, dataset[i], caption_mode)
+        sample = dataset[i]
+        r = _predict_sample(model, sample, caption_mode)
         metrics.append({'ade': r['ade'], 'fde': r['fde']})
         
-        # Work in BGR for cv2
-        frame = cv2.cvtColor(r['frame'], cv2.COLOR_RGB2BGR)
-        h, w = frame.shape[:2]
+        # Get GT caption from sample
+        gt_caption = sample.get('caption', 'N/A')
         
-        # Draw trajectories
-        if show_gt:
-            frame = _draw_trajectory(frame, r['gt_traj'], r['extrinsic'], r['intrinsic'], (0, 255, 0))  # Green
-        frame = _draw_trajectory(frame, r['pred_traj'], r['extrinsic'], r['intrinsic'], (0, 0, 255))  # Red
+        # Create figure with 2 columns
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
         
-        # Text overlay
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(frame, f"Speed: {r['speed']:.1f} m/s", (10, 30), font, 0.6, (0, 200, 255), 2)
-        cv2.putText(frame, f"ADE: {r['ade']:.2f}m  FDE: {r['fde']:.2f}m", (10, 55), font, 0.6, (0, 200, 255), 2)
+        # Left: Image with trajectory overlay
+        ax1 = axes[0]
+        plot_trajectory_on_image(r['frame'], r['gt_traj'], r['extrinsic'], r['intrinsic'], 
+                                 color='green', label='GT', ax=ax1)
+        plot_trajectory_on_image(r['frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
+                                 color='red', label='Pred', ax=ax1)
+        ax1.legend(loc='upper right')
+        ax1.set_title(f"Frame {i} | ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | Speed: {r['speed']:.1f} m/s")
         
-        # Caption bar
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, h-50), (w, h), (0, 0, 0), -1)
-        frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
-        cv2.putText(frame, r['pred_caption'][:120], (10, h-20), font, 0.45, (255, 255, 255), 1)
+        # Right: Bird's eye view
+        ax2 = axes[1]
+        ax2.plot(r['gt_traj'][:, 0], r['gt_traj'][:, 1], 'g-o', markersize=6, linewidth=2, label='GT')
+        ax2.plot(r['pred_traj'][:, 0], r['pred_traj'][:, 1], 'r-o', markersize=6, linewidth=2, label='Pred')
+        ax2.scatter([0], [0], c='blue', s=150, marker='*', label='Ego', zorder=5)
+        ax2.set_xlabel('Forward (m)')
+        ax2.set_ylabel('Lateral (m)')
+        ax2.legend(loc='upper right')
+        ax2.grid(True, alpha=0.3)
+        ax2.set_aspect('equal')
+        ax2.set_title("Bird's Eye View")
         
-        # Legend
-        cv2.putText(frame, "GT", (w-80, 30), font, 0.5, (0, 255, 0), 2)
-        cv2.putText(frame, "Pred", (w-80, 55), font, 0.5, (0, 0, 255), 2)
+        plt.tight_layout()
         
-        # Save image
-        cv2.imwrite(f"{output_dir}/{i-start_idx:04d}.png", frame)
+        # Add captions as text below the figure
+        gt_text = f"GT: {gt_caption[:300]}..." if len(gt_caption) > 300 else f"GT: {gt_caption}"
+        pred_text = f"Pred: {r['pred_caption'][:300]}..." if len(r['pred_caption']) > 300 else f"Pred: {r['pred_caption']}"
+        
+        fig.text(0.02, 0.02, gt_text, fontsize=9, color='green', wrap=True)
+        fig.text(0.02, -0.03, pred_text, fontsize=9, color='red', wrap=True)
+        
+        # Adjust layout to make room for captions
+        plt.subplots_adjust(bottom=0.15)
+        
+        # Save
+        plt.savefig(f"{output_dir}/{i-start_idx:04d}.png", dpi=120, bbox_inches='tight')
+        plt.close(fig)
     
     avg_ade = np.mean([m['ade'] for m in metrics])
     avg_fde = np.mean([m['fde'] for m in metrics])
