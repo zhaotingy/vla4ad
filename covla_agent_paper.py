@@ -1181,198 +1181,53 @@ def visualize_inference(
     """
     Visualize model inference with trajectory overlay on image.
     
-    Following the style of:
-    https://huggingface.co/datasets/turing-motors/CoVLA-Dataset/blob/main/tutorial.ipynb
-    
-    Paper Table 4 - Two inference modes:
-    - caption_mode="pred": Generate caption → use for trajectory (ADE ~0.955)
-    - caption_mode="gt":   Use GT caption → trajectory (ADE ~0.814, oracle)
-    
-    Args:
-        model: CoVLAAgentPaper model
-        image: Input image tensor (3, H, W) or (1, 3, H, W)
-        gt_trajectory: Ground truth trajectory (N, 3)
-        extrinsic_matrix: Camera extrinsic matrix
-        intrinsic_matrix: Camera intrinsic matrix
-        gt_caption: Ground truth caption (required if caption_mode="gt")
-        image_path: Path to original image file (optional, for high-res display)
-        speed: Ego vehicle speed in m/s (important if model trained with speed embedding)
-        caption_mode: "none" (default) or "gt" - see Paper Table 4
+    For simpler API, use: visualize(model, dataset, idx)
     """
     import matplotlib.pyplot as plt
     
-    # Get model prediction based on caption mode
-    result = model.predict(
-        image, 
-        speed=speed, 
-        caption=gt_caption,
-        caption_mode=caption_mode,
-    )
+    result = model.predict(image, speed=speed, caption=gt_caption, caption_mode=caption_mode)
     pred_traj = result['trajectory']
     pred_caption = result['caption']
     
-    # Load high-res image if path provided, else convert tensor
+    # Load frame
     if image_path and os.path.exists(image_path):
-        frame = np.array(Image.open(image_path))
-        if frame.shape[2] == 4:  # RGBA
-            frame = frame[:, :, :3]
+        frame = np.array(Image.open(image_path).convert('RGB'))
     else:
-        # Convert tensor to numpy
         if image.dim() == 4:
             image = image[0]
         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-        frame = ((image.cpu() * std + mean).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        frame = ((image.cpu() * std + mean).clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
     
-    # Compute metrics
-    pred_tensor = torch.tensor(pred_traj).unsqueeze(0)
-    gt_tensor = torch.tensor(gt_trajectory).unsqueeze(0)
-    ade = compute_ade(pred_tensor, gt_tensor)
-    fde = compute_fde(pred_tensor, gt_tensor)
+    # Metrics
+    ade = compute_ade(torch.tensor(pred_traj).unsqueeze(0), torch.tensor(gt_trajectory).unsqueeze(0))
+    fde = compute_fde(torch.tensor(pred_traj).unsqueeze(0), torch.tensor(gt_trajectory).unsqueeze(0))
     
-    # Create figure
-    fig = plt.figure(figsize=(16, 10))
+    # Plot
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     
-    # Top: Image with trajectory overlay
-    ax1 = fig.add_subplot(2, 2, 1)
-    plot_trajectory_on_image(
-        frame, gt_trajectory, extrinsic_matrix, intrinsic_matrix,
-        color='green', label='Ground Truth', ax=ax1
-    )
-    plot_trajectory_on_image(
-        frame, pred_traj, extrinsic_matrix, intrinsic_matrix,
-        color='red', label='Predicted', ax=ax1
-    )
-    ax1.legend(loc='upper right')
-    ax1.set_title("Trajectory on Image", fontsize=12)
+    plot_trajectory_on_image(frame, gt_trajectory, extrinsic_matrix, intrinsic_matrix, 
+                             color='green', label='GT', ax=axes[0])
+    plot_trajectory_on_image(frame, pred_traj, extrinsic_matrix, intrinsic_matrix, 
+                             color='red', label='Pred', ax=axes[0])
+    axes[0].legend()
+    axes[0].set_title(f"ADE: {ade:.2f}m | FDE: {fde:.2f}m")
     
-    # Top right: Bird's eye view
-    ax2 = fig.add_subplot(2, 2, 2)
-    ax2.plot(gt_trajectory[:, 0], gt_trajectory[:, 1], 'g-o', 
-            markersize=5, linewidth=2, label='Ground Truth')
-    ax2.plot(pred_traj[:, 0], pred_traj[:, 1], 'r-o',
-            markersize=5, linewidth=2, label='Predicted')
-    ax2.scatter([0], [0], c='blue', s=100, marker='*', label='Ego', zorder=5)
-    ax2.set_xlabel('Forward (m)')
-    ax2.set_ylabel('Lateral (m)')
-    ax2.set_title(f"Bird's Eye View\nADE: {ade:.2f}m | FDE: {fde:.2f}m", fontsize=12)
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    ax2.set_aspect('equal')
-    
-    # Bottom: Captions
-    ax3 = fig.add_subplot(2, 1, 2)
-    ax3.axis('off')
-    
-    caption_text = f"""🤖 Generated Caption:
-{pred_caption[:400]}{'...' if len(pred_caption) > 400 else ''}
-
-"""
-    if gt_caption:
-        caption_text += f"""📝 Ground Truth Caption:
-{gt_caption[:400]}{'...' if len(gt_caption) > 400 else ''}
-
-"""
-    caption_text += f"""📊 Metrics:
-  • ADE (Average Displacement Error): {ade:.3f} m
-  • FDE (Final Displacement Error): {fde:.3f} m"""
-    
-    ax3.text(0.02, 0.95, caption_text, transform=ax3.transAxes,
-             fontsize=10, verticalalignment='top', fontfamily='sans-serif',
-             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9, pad=10),
-             wrap=True)
+    axes[1].plot(gt_trajectory[:, 0], gt_trajectory[:, 1], 'g-o', markersize=5, label='GT')
+    axes[1].plot(pred_traj[:, 0], pred_traj[:, 1], 'r-o', markersize=5, label='Pred')
+    axes[1].scatter([0], [0], c='blue', s=100, marker='*', label='Ego')
+    axes[1].set_xlabel('Forward (m)')
+    axes[1].set_ylabel('Lateral (m)')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    axes[1].set_aspect('equal')
+    axes[1].set_title("Bird's Eye View")
     
     plt.tight_layout()
     plt.show()
     
-    return {
-        'pred_trajectory': pred_traj,
-        'pred_caption': pred_caption,
-        'ade': ade,
-        'fde': fde,
-    }
-
-
-def visualize_prediction_paper(
-    model: CoVLAAgentPaper,
-    sample: Dict,
-    state: Dict = None,
-    image_path: str = None,
-):
-    """
-    Visualize prediction vs ground truth (simplified interface).
-    
-    Args:
-        model: CoVLAAgentPaper model
-        sample: Dataset sample with 'image', 'trajectory', 'caption'
-        state: Original state dict with camera matrices (optional)
-        image_path: Path to original image (optional)
-    """
-    import matplotlib.pyplot as plt
-    
-    # Get trajectories
-    gt_traj = sample['trajectory'].numpy() if torch.is_tensor(sample['trajectory']) else sample['trajectory']
-    
-    # Check if we have camera matrices
-    if state and 'extrinsic_matrix' in state and 'intrinsic_matrix' in state:
-        extrinsic = np.array(state['extrinsic_matrix'])
-        intrinsic = np.array(state['intrinsic_matrix'])
-        
-        return visualize_inference(
-            model=model,
-            image=sample['image'],
-            gt_trajectory=gt_traj,
-            extrinsic_matrix=extrinsic,
-            intrinsic_matrix=intrinsic,
-            gt_caption=sample.get('caption') or sample.get('plain_caption'),
-            image_path=image_path,
-        )
-    else:
-        # Fallback: just show bird's eye view and caption
-        result = model.predict(sample['image'])
-        pred_traj = result['trajectory']
-        
-        # Compute metrics
-        pred_tensor = torch.tensor(pred_traj).unsqueeze(0)
-        gt_tensor = torch.tensor(gt_traj).unsqueeze(0)
-        ade = compute_ade(pred_tensor, gt_tensor)
-        fde = compute_fde(pred_tensor, gt_tensor)
-        
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        
-        # Left: Bird's eye view
-        ax1 = axes[0]
-        ax1.plot(gt_traj[:, 0], gt_traj[:, 1], 'g-o', markersize=6, 
-                linewidth=2, label='Ground Truth')
-        ax1.plot(pred_traj[:, 0], pred_traj[:, 1], 'r-o', markersize=6,
-                linewidth=2, label='Predicted')
-        ax1.scatter([0], [0], c='blue', s=150, marker='*', label='Ego', zorder=5)
-        ax1.set_xlabel('Forward (m)')
-        ax1.set_ylabel('Lateral (m)')
-        ax1.set_title(f"Trajectory (Bird's Eye View)\nADE: {ade:.2f}m | FDE: {fde:.2f}m")
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        ax1.set_aspect('equal')
-        
-        # Right: Caption
-        ax2 = axes[1]
-        ax2.axis('off')
-        
-        caption_text = f"""🤖 Generated Caption:
-{result['caption'][:300]}...
-
-📊 Metrics:
-  • ADE: {ade:.3f} m
-  • FDE: {fde:.3f} m"""
-        
-        ax2.text(0.05, 0.95, caption_text, transform=ax2.transAxes,
-                 fontsize=10, verticalalignment='top',
-                 bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
-        
-        plt.tight_layout()
-        plt.show()
-        
-        return {'pred_trajectory': pred_traj, 'pred_caption': result['caption'], 'ade': ade, 'fde': fde}
+    print(f"📝 Caption: {pred_caption[:200]}...")
+    return {'pred_trajectory': pred_traj, 'pred_caption': pred_caption, 'ade': ade, 'fde': fde, 'caption': pred_caption}
 
 
 def plot_training_curves(history: Dict):
@@ -1462,4 +1317,209 @@ plot_training_curves(history)
 # 6. Visualize predictions
 visualize_prediction_paper(model, val_dataset[0])
 """)
+
+
+def _draw_trajectory(frame, trajectory, extrinsic, intrinsic, color):
+    """Helper: project and draw trajectory on frame. Returns modified frame."""
+    import cv2
+    h, w = frame.shape[:2]
+    if extrinsic.shape[0] == 4:
+        extrinsic = extrinsic[:3, :]
+    
+    traj_cam = np.array([device_to_camera(p, extrinsic) for p in trajectory])
+    valid = traj_cam[:, 2] > 0
+    if not np.any(valid):
+        return frame
+    
+    traj_img = np.array([camera_to_image(p, intrinsic) for p in traj_cam[valid]])
+    mask = (traj_img[:, 0] >= 0) & (traj_img[:, 0] < w) & (traj_img[:, 1] >= 0) & (traj_img[:, 1] < h)
+    traj_img = traj_img[mask]
+    
+    if len(traj_img) > 1:
+        pts = traj_img.astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(frame, [pts], False, color, 3)
+        for pt in traj_img:
+            cv2.circle(frame, tuple(pt.astype(int)), 5, color, -1)
+    return frame
+
+
+def _to_numpy(x):
+    """Convert tensor/list to numpy array."""
+    if hasattr(x, 'numpy'):
+        return x.numpy()
+    return np.array(x)
+
+
+def _load_frame(sample, debug=False):
+    """Load high-res frame from sample, fallback to tensor denormalization."""
+    if 'image_path' in sample and os.path.exists(sample['image_path']):
+        frame = np.array(Image.open(sample['image_path']).convert('RGB'))
+        if debug:
+            print(f"  Loaded from path: {sample['image_path']}, shape={frame.shape}, dtype={frame.dtype}")
+        return frame
+    # Denormalize tensor
+    if debug:
+        print(f"  No image_path, using tensor. Keys: {list(sample.keys())}")
+    t = sample['image']
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    img = (t.cpu() * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
+    frame = (img * 255).astype(np.uint8)
+    if debug:
+        print(f"  Tensor denorm: shape={frame.shape}, min={frame.min()}, max={frame.max()}")
+    return frame
+
+
+def _predict_sample(model, sample, caption_mode="pred", debug=False):
+    """
+    Run inference on a dataset sample. Returns dict with all needed data.
+    
+    Returns:
+        dict with: frame, gt_traj, pred_traj, extrinsic, intrinsic, 
+                   speed, gt_caption, pred_caption, ade, fde
+    """
+    device = next(model.parameters()).device
+    
+    # Extract data from sample
+    frame = _load_frame(sample, debug=debug)
+    gt_traj = _to_numpy(sample['trajectory'])
+    extrinsic = _to_numpy(sample['extrinsic_matrix'])
+    intrinsic = _to_numpy(sample['intrinsic_matrix'])
+    speed = sample['speed'].item() if hasattr(sample['speed'], 'item') else float(sample['speed'])
+    gt_caption = sample.get('caption', '')
+    
+    # Run inference
+    with torch.no_grad():
+        result = model.predict(
+            sample['image'].unsqueeze(0).to(device),
+            speed=speed,
+            caption=gt_caption if caption_mode == "gt" else None,
+            caption_mode=caption_mode
+        )
+    pred_traj = result['trajectory']
+    pred_caption = result.get('caption', gt_caption)
+    
+    # Compute metrics
+    ade = compute_ade(torch.tensor(pred_traj).unsqueeze(0), torch.tensor(gt_traj).unsqueeze(0))
+    fde = compute_fde(torch.tensor(pred_traj).unsqueeze(0), torch.tensor(gt_traj).unsqueeze(0))
+    
+    return {
+        'frame': frame,
+        'gt_traj': gt_traj,
+        'pred_traj': pred_traj,
+        'extrinsic': extrinsic,
+        'intrinsic': intrinsic,
+        'speed': speed,
+        'gt_caption': gt_caption,
+        'pred_caption': pred_caption,
+        'ade': ade,
+        'fde': fde,
+    }
+
+
+def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
+    """
+    Visualize model prediction on a dataset sample (matplotlib).
+    
+    Usage:
+        visualize(model, val_dataset, idx=0)
+        visualize(model, val_dataset, idx=10, caption_mode="gt")
+    """
+    import matplotlib.pyplot as plt
+    
+    r = _predict_sample(model, dataset[idx], caption_mode)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Left: Image with trajectories
+    ax1 = axes[0]
+    plot_trajectory_on_image(r['frame'], r['gt_traj'], r['extrinsic'], r['intrinsic'], 
+                             color='green', label='GT', ax=ax1)
+    plot_trajectory_on_image(r['frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
+                             color='red', label='Pred', ax=ax1)
+    ax1.legend(loc='upper right')
+    ax1.set_title(f"ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | Speed: {r['speed']:.1f} m/s")
+    
+    # Right: Bird's eye view
+    ax2 = axes[1]
+    ax2.plot(r['gt_traj'][:, 0], r['gt_traj'][:, 1], 'g-o', markersize=5, label='GT')
+    ax2.plot(r['pred_traj'][:, 0], r['pred_traj'][:, 1], 'r-o', markersize=5, label='Pred')
+    ax2.scatter([0], [0], c='blue', s=100, marker='*', label='Ego', zorder=5)
+    ax2.set_xlabel('Forward (m)')
+    ax2.set_ylabel('Lateral (m)')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.set_aspect('equal')
+    ax2.set_title("Bird's Eye View")
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print(f"🚗 Speed: {r['speed']:.1f} m/s")
+    print(f"📝 Caption: {r['pred_caption'][:200]}...")
+
+
+def generate_eval_images(
+    model,
+    dataset,
+    output_dir: str = "eval",
+    start_idx: int = 0,
+    num_frames: int = 50,
+    caption_mode: str = "pred",
+    show_gt: bool = True,
+):
+    """
+    Generate evaluation images with trajectory overlay.
+    
+    Usage:
+        generate_eval_images(model, val_dataset, "eval", num_frames=30)
+    
+    Output: eval/0000.png, eval/0001.png, ...
+    """
+    import cv2
+    from tqdm import tqdm
+    
+    os.makedirs(output_dir, exist_ok=True)
+    end_idx = min(start_idx + num_frames, len(dataset))
+    print(f"🖼️ Generating {end_idx - start_idx} images → {output_dir}/")
+    model.eval()
+    
+    metrics = []
+    
+    for i in tqdm(range(start_idx, end_idx), desc="Processing"):
+        r = _predict_sample(model, dataset[i], caption_mode)
+        metrics.append({'ade': r['ade'], 'fde': r['fde']})
+        
+        # Work in BGR for cv2
+        frame = cv2.cvtColor(r['frame'], cv2.COLOR_RGB2BGR)
+        h, w = frame.shape[:2]
+        
+        # Draw trajectories
+        if show_gt:
+            frame = _draw_trajectory(frame, r['gt_traj'], r['extrinsic'], r['intrinsic'], (0, 255, 0))  # Green
+        frame = _draw_trajectory(frame, r['pred_traj'], r['extrinsic'], r['intrinsic'], (0, 0, 255))  # Red
+        
+        # Text overlay
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(frame, f"Speed: {r['speed']:.1f} m/s", (10, 30), font, 0.6, (0, 200, 255), 2)
+        cv2.putText(frame, f"ADE: {r['ade']:.2f}m  FDE: {r['fde']:.2f}m", (10, 55), font, 0.6, (0, 200, 255), 2)
+        
+        # Caption bar
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, h-50), (w, h), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+        cv2.putText(frame, r['pred_caption'][:120], (10, h-20), font, 0.45, (255, 255, 255), 1)
+        
+        # Legend
+        cv2.putText(frame, "GT", (w-80, 30), font, 0.5, (0, 255, 0), 2)
+        cv2.putText(frame, "Pred", (w-80, 55), font, 0.5, (0, 0, 255), 2)
+        
+        # Save image
+        cv2.imwrite(f"{output_dir}/{i-start_idx:04d}.png", frame)
+    
+    avg_ade = np.mean([m['ade'] for m in metrics])
+    avg_fde = np.mean([m['fde'] for m in metrics])
+    print(f"✅ Saved {len(metrics)} images to {output_dir}/ | ADE: {avg_ade:.3f}m, FDE: {avg_fde:.3f}m")
+    print(f"📹 To create video: ffmpeg -framerate 2 -i {output_dir}/%04d.png -c:v libx264 -pix_fmt yuv420p output.mp4")
+    return {'output_dir': output_dir, 'num_frames': len(metrics), 'avg_ade': avg_ade, 'avg_fde': avg_fde}
 

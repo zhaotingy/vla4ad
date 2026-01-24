@@ -833,73 +833,45 @@ print(f"Trajectory shape: {result['trajectory'].shape}")  # (10, 3)
 print(f"Caption used: {result['caption'][:100]}...")
 ```
 
-### Cell 8: Visualize with Trajectory on Image (Tutorial Style)
+### Cell 8: Visualize Predictions
 ```python
-# Get a sample (now includes camera matrices)
-idx = 0
-sample = val_dataset[idx]
+from covla_agent_paper import visualize
 
-# ============================================================
-# Option A: "Pred. caption" mode (paper ADE ~0.955)
-# Generate caption first → use it for trajectory prediction
-# ============================================================
-result = visualize_inference(
-    model=model,
-    image=sample['image'],
-    gt_trajectory=sample['trajectory'].numpy(),
-    extrinsic_matrix=np.array(sample['extrinsic_matrix']),
-    intrinsic_matrix=np.array(sample['intrinsic_matrix']),
-    speed=sample['speed'],  # REQUIRED
-    gt_caption=sample.get('caption'),
-    caption_mode="pred",  # Generate caption → trajectory (default)
-)
+# Simple API - just pass model, dataset, and index!
+visualize(model, val_dataset, idx=0)
 
-print(f"ADE: {result['ade']:.3f}m")
-print(f"FDE: {result['fde']:.3f}m")
-print(f"Caption: {result['caption'][:100]}...")
-
-# ============================================================
-# Option B: "GT caption" mode (paper ADE ~0.814) - BETTER!
-# Use ground truth caption → trajectory (oracle mode)
-# ============================================================
-# result = visualize_inference(
-#     model=model,
-#     image=sample['image'],
-#     gt_trajectory=sample['trajectory'].numpy(),
-#     extrinsic_matrix=np.array(sample['extrinsic_matrix']),
-#     intrinsic_matrix=np.array(sample['intrinsic_matrix']),
-#     speed=sample['speed'],
-#     gt_caption=sample.get('caption'),
-#     caption_mode="gt",  # Use GT caption → better ADE!
-# )
+# With GT caption (oracle mode - better ADE)
+visualize(model, val_dataset, idx=0, caption_mode="gt")
 ```
 
 ### Cell 9: Visualize Multiple Samples
 ```python
-# Visualize multiple predictions
-# caption_mode="pred": Generate caption → trajectory (paper ADE ~0.955)
-# caption_mode="gt":   Use GT caption → trajectory (paper ADE ~0.814)
-CAPTION_MODE = "pred"  # or "gt" for better ADE (oracle mode)
-
 for idx in [0, 10, 20]:
     if idx < len(val_dataset):
-        sample = val_dataset[idx]
-        
-        print(f"\n{'='*50}")
-        print(f"Sample {idx} | Mode: {CAPTION_MODE}")
-        print(f"{'='*50}")
-        
-        visualize_inference(
-            model=model,
-            image=sample['image'],
-            gt_trajectory=sample['trajectory'].numpy(),
-            extrinsic_matrix=np.array(sample['extrinsic_matrix']),
-            intrinsic_matrix=np.array(sample['intrinsic_matrix']),
-            speed=sample['speed'],
-            gt_caption=sample.get('caption'),
-            caption_mode=CAPTION_MODE,
-        )
+        print(f"\n{'='*50}\nSample {idx}\n{'='*50}")
+        visualize(model, val_dataset, idx)
 ```
+
+### Cell 10: Generate Video
+```python
+from covla_agent_paper import generate_video
+
+generate_video(
+    model, 
+    val_dataset, 
+    output_path="demo.mp4", 
+    num_frames=30,          # Number of frames
+    fps=2,                  # Output FPS
+    caption_mode="pred",    # "pred" or "gt"
+    show_gt=True,           # Show GT trajectory (green)
+)
+```
+
+**Output video shows:**
+- 🟢 Green: Ground truth trajectory
+- 🔴 Red: Predicted trajectory  
+- Top-left: Speed, ADE/FDE metrics
+- Bottom: Generated caption
 
 ---
 
