@@ -367,6 +367,59 @@ class CoVLAAgentPaper(nn.Module):
         except ImportError:
             print("⚠ PEFT not installed, training full model")
     
+    def save_trainable(self, path: str = "covla_trainable.pt"):
+        """
+        Save only trainable components (efficient - ~50MB instead of ~5GB).
+        
+        Saves: LoRA adapters, vision_projection, speed_embedding, 
+               trajectory_queries, trajectory_mlp
+        """
+        trainable_state = {
+            'vision_projection': self.vision_projection.state_dict(),
+            'speed_embedding': self.speed_embedding.state_dict() if self.speed_embedding else None,
+            'trajectory_queries': self.trajectory_queries.data,
+            'trajectory_mlp': self.trajectory_mlp.state_dict(),
+            'config': self.config,
+        }
+        
+        # Save LoRA weights if using PEFT
+        if hasattr(self.language_model, 'peft_config'):
+            trainable_state['lora'] = {
+                k: v for k, v in self.language_model.state_dict().items() 
+                if 'lora' in k.lower()
+            }
+        
+        torch.save(trainable_state, path)
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        print(f"✓ Saved trainable weights to: {path} ({size_mb:.1f} MB)")
+    
+    def load_trainable(self, path: str = "covla_trainable.pt"):
+        """
+        Load only trainable components.
+        
+        Usage:
+            model = CoVLAAgentPaper(config)  # Creates fresh base models
+            model.load_trainable("covla_trainable.pt")  # Loads trained weights
+        """
+        checkpoint = torch.load(path, map_location=self.config.device)
+        
+        self.vision_projection.load_state_dict(checkpoint['vision_projection'])
+        if checkpoint['speed_embedding'] and self.speed_embedding:
+            self.speed_embedding.load_state_dict(checkpoint['speed_embedding'])
+        self.trajectory_queries.data = checkpoint['trajectory_queries'].to(self.config.device)
+        self.trajectory_mlp.load_state_dict(checkpoint['trajectory_mlp'])
+        
+        # Load LoRA weights
+        if 'lora' in checkpoint and hasattr(self.language_model, 'peft_config'):
+            current_state = self.language_model.state_dict()
+            current_state.update(checkpoint['lora'])
+            self.language_model.load_state_dict(current_state)
+        
+        # Move entire model to device
+        self.to(self.config.device)
+        
+        print(f"✓ Loaded trainable weights from: {path}")
+    
     def encode_image(self, images: torch.Tensor) -> torch.Tensor:
         """
         Encode images using vision encoder.
@@ -860,6 +913,8 @@ class CoVLATrainerPaper:
         print(header)
         print("-" * len(header))
         
+        best_ade = float('inf')
+        
         for epoch in range(num_epochs):
             # Train
             train_metrics = self.train_epoch(train_loader)
@@ -874,8 +929,16 @@ class CoVLATrainerPaper:
                 
                 print(f"{epoch+1:<8}{train_metrics['loss']:<12.4f}{val_metrics['loss']:<12.4f}"
                       f"{val_metrics['ade']:<10.3f}{val_metrics['fde']:<10.3f}")
+                
+                # Save best model
+                if val_metrics['ade'] < best_ade:
+                    best_ade = val_metrics['ade']
+                    self.model.save_trainable("covla_best.pt")
             else:
                 print(f"{epoch+1:<8}{train_metrics['loss']:<12.4f}")
+            
+            # Save checkpoint each epoch
+            self.model.save_trainable(f"covla_epoch_{epoch+1}.pt")
         
         print("\n✓ Training complete!")
         
@@ -886,53 +949,26 @@ class CoVLATrainerPaper:
             print(f"\nFinal Results:")
             print(f"  ADE: {final_ade:.3f} (paper with predicted captions: 0.955)")
             print(f"  FDE: {final_fde:.3f} (paper with predicted captions: 2.239)")
-        
-        # Auto-save model
-        save_path = "covla_model.pt"
-        self.save_checkpoint(save_path)
-        print(f"\n✓ Model saved to: {save_path}")
+            print(f"  Best ADE: {best_ade:.3f} (saved as covla_best.pt)")
         
         return self.history
-    
-    def save_checkpoint(self, path: str = "covla_model.pt"):
-        """Save model checkpoint."""
-        checkpoint = {
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'config': self.config,
-            'history': self.history,
-        }
-        torch.save(checkpoint, path)
-        print(f"Saved checkpoint to: {path}")
-    
-    def load_checkpoint(self, path: str = "covla_model.pt"):
-        """Load model checkpoint."""
-        checkpoint = torch.load(path, map_location=self.config.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.history = checkpoint.get('history', self.history)
-        print(f"Loaded checkpoint from: {path}")
-        return checkpoint.get('config')
 
 
-def load_model(path: str = "covla_model.pt", device: str = "cuda") -> CoVLAAgentPaper:
+def load_model(path: str = "covla_trainable.pt", device: str = "cuda") -> CoVLAAgentPaper:
     """
-    Load a saved model checkpoint.
+    Load a trained model (efficient - loads only trainable weights).
     
     Usage:
-        model = load_model("covla_model.pt")
-        result = model.predict(image, speed=speed, caption_mode="gt", caption=caption)
+        model = load_model("covla_trainable.pt")
+        result = model.predict(image, speed=speed, caption_mode="pred")
     """
     checkpoint = torch.load(path, map_location=device)
     config = checkpoint.get('config', CoVLAConfig(device=device))
+    config.device = device
     
     model = CoVLAAgentPaper(config)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_trainable(path)
     model.eval()
-    
-    print(f"✓ Loaded model from: {path}")
-    if 'history' in checkpoint and checkpoint['history'].get('val_ade'):
-        print(f"  Last ADE: {checkpoint['history']['val_ade'][-1]:.3f}m")
     
     return model
 

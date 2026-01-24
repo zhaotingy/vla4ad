@@ -780,23 +780,32 @@ val_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, spli
 # Create model
 model = CoVLAAgentPaper(config)
 
-# Train (auto-saves to covla_model.pt)
+# Train (auto-saves after each epoch)
 trainer = CoVLATrainerPaper(model, config)
 history = trainer.train(train_dataset, val_dataset, num_epochs=10)
 
+# Saves automatically:
+# - covla_epoch_1.pt, covla_epoch_2.pt, ... (each epoch)
+# - covla_best.pt (best ADE model)
+
 # Manual save (optional)
-# trainer.save_checkpoint("my_model.pt")
+# model.save_trainable("my_model.pt")  # ~50MB (only trainable weights)
 ```
 
 ### Cell 6c: Load Saved Model (skip training)
 ```python
-from covla_agent_paper import load_model
+from covla_agent_paper import load_model, CoVLAConfig, CoVLAAgentPaper
 
-# Load previously trained model
-model = load_model("covla_model.pt")
+# Option 1: Simple load
+model = load_model("covla_best.pt")
 
-# Or with custom path
-# model = load_model("/path/to/my_model.pt", device="cuda")
+# Option 2: Load specific epoch
+model = load_model("covla_epoch_5.pt", device="cuda")
+
+# Option 3: Manual load (if you need custom config)
+config = CoVLAConfig(device="cuda", use_paper_model=False)
+model = CoVLAAgentPaper(config)
+model.load_trainable("covla_best.pt")
 ```
 
 ### Model Comparison
@@ -805,6 +814,17 @@ model = load_model("covla_model.pt")
 |---------|--------|----------|------|-----------------|----------|
 | `use_paper_model=True` | CLIP ViT-L/14 | Mistral 7B | ~24GB | ⭐⭐⭐ Best | ✅ None |
 | `use_paper_model=False` | CLIP ViT-B/32 | TinyLlama 1.1B | ~8GB | ⭐ Basic | ✅ None |
+
+### Saved Files
+
+Training automatically saves efficient checkpoints (~50MB instead of ~5GB):
+
+| File | Description |
+|------|-------------|
+| `covla_epoch_N.pt` | Checkpoint after epoch N |
+| `covla_best.pt` | Best model (lowest validation ADE) |
+
+Only trainable weights are saved (LoRA, projections, embeddings). Base models are reloaded from HuggingFace.
 
 **Alternative 7B models** (change in config if needed):
 - `mistralai/Mistral-7B-Instruct-v0.2` - Open, no approval (DEFAULT)
