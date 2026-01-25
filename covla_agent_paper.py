@@ -33,6 +33,33 @@ import os
 
 
 # =============================================================================
+# Ego State Normalization Constants
+# =============================================================================
+
+EGO_STATE_SCALES = {
+    'vEgo': 30.0,           # Speed: 0-30 m/s → 0-1
+    'aEgo': 5.0,            # Accel: -5 to 5 m/s² → -1 to 1
+    'steeringAngleDeg': 500.0,  # Steering: -500 to 500° → -1 to 1
+}
+
+def normalize_ego_state(vEgo: float, aEgo: float = 0.0, steeringAngleDeg: float = 0.0) -> np.ndarray:
+    """Normalize ego state values to [-1, 1] range."""
+    return np.array([
+        vEgo / EGO_STATE_SCALES['vEgo'],
+        aEgo / EGO_STATE_SCALES['aEgo'],
+        steeringAngleDeg / EGO_STATE_SCALES['steeringAngleDeg'],
+    ], dtype=np.float32)
+
+def denormalize_ego_state(ego_state: np.ndarray) -> dict:
+    """Denormalize ego state array back to original units."""
+    return {
+        'vEgo': ego_state[0] * EGO_STATE_SCALES['vEgo'],
+        'aEgo': ego_state[1] * EGO_STATE_SCALES['aEgo'],
+        'steeringAngleDeg': ego_state[2] * EGO_STATE_SCALES['steeringAngleDeg'],
+    }
+
+
+# =============================================================================
 # Configuration (matching paper)
 # =============================================================================
 
@@ -71,9 +98,9 @@ class CoVLAConfig:
     trajectory_dim: int = 3  # x, y, z
     trajectory_horizon: float = 3.0  # seconds
     
-    # Speed embedding (paper includes ego vehicle speed)
-    use_speed_embedding: bool = True
-    speed_embedding_dim: int = 64
+    # Ego state embedding (paper includes ego vehicle speed)
+    use_extended_ego_state: bool = False  # Use [vEgo, aEgo, steering] instead of just speed
+    ego_state_dim: int = 3  # vEgo, aEgo, steeringAngleDeg
     
     # Training
     batch_size: int = 8
@@ -164,11 +191,18 @@ class CoVLADatasetPaper(Dataset):
             if 'vEgo' not in state:
                 raise KeyError(f"'vEgo' not found in state at index {i}. Available keys: {list(state.keys())}")
             
+            # Extended ego state: [vEgo, aEgo, steeringAngleDeg] normalized
+            ego_state = normalize_ego_state(
+                state['vEgo'],
+                state.get('aEgo', 0.0),
+                state.get('steeringAngleDeg', 0.0),
+            )
+            
             self.samples.append({
                 'image_path': image_files[i],
                 'trajectory': sampled_trajectory,
                 'caption': caption.get('rich_caption', caption.get('plain_caption', '')),
-                'speed': state['vEgo'],
+                'ego_state': ego_state,  # [vEgo/30, aEgo/5, steering/500] normalized
                 'extrinsic_matrix': state['extrinsic_matrix'],
                 'intrinsic_matrix': state['intrinsic_matrix'],
             })
@@ -209,14 +243,14 @@ class CoVLADatasetPaper(Dataset):
         # Trajectory: (10, 3)
         trajectory = torch.tensor(sample['trajectory'], dtype=torch.float32)
         
-        # Speed (already extracted in __init__)
-        speed = torch.tensor(sample.get('speed', 0.0), dtype=torch.float32)
+        # Ego state: [vEgo/30, aEgo/5, steering/500] normalized
+        ego_state = torch.tensor(sample['ego_state'], dtype=torch.float32)
         
         return {
             'image': image,
             'trajectory': trajectory,
             'caption': sample['caption'],
-            'speed': speed,
+            'ego_state': ego_state,  # (3,) [vEgo/30, aEgo/5, steering/500] normalized
             'extrinsic_matrix': sample.get('extrinsic_matrix'),
             'intrinsic_matrix': sample.get('intrinsic_matrix'),
             'image_path': sample['image_path'],
@@ -323,15 +357,11 @@ class CoVLAAgentPaper(nn.Module):
             torch.randn(1, self.num_trajectory_queries, self.llm_dim) * 0.02
         )
         
-        # Speed embedding MLP (paper: embeds ego vehicle speed)
-        if config.use_speed_embedding:
-            self.speed_embedding = nn.Sequential(
-                nn.Linear(1, config.speed_embedding_dim),
-                nn.ReLU(),
-                nn.Linear(config.speed_embedding_dim, self.llm_dim),
-            )
-        else:
-            self.speed_embedding = None
+        # Ego state embedding (paper: embeds ego vehicle speed)
+        # Input dim: 1 for speed only, or ego_state_dim for extended state
+        input_dim = config.ego_state_dim if config.use_extended_ego_state else 1
+        self.speed_embedding = nn.Linear(input_dim, self.llm_dim)
+        self.use_extended_ego_state = config.use_extended_ego_state
         
         # Trajectory MLP (paper specification)
         self.trajectory_mlp = TrajectoryMLP(
@@ -350,7 +380,7 @@ class CoVLAAgentPaper(nn.Module):
         print(f"✓ CoVLA-Agent initialized ({model_type})")
         print(f"  Vision: {config.vision_encoder}")
         print(f"  Language: {config.language_model}")
-        print(f"  Speed embedding: {config.use_speed_embedding}")
+        print(f"  Ego state: {'extended (vEgo, aEgo, steering)' if config.use_extended_ego_state else 'speed only'}")
         print(f"  Total params: {total:,}")
         print(f"  Trainable: {trainable:,}")
     
@@ -380,7 +410,7 @@ class CoVLAAgentPaper(nn.Module):
         """
         trainable_state = {
             'vision_projection': self.vision_projection.state_dict(),
-            'speed_embedding': self.speed_embedding.state_dict() if self.speed_embedding else None,
+            'speed_embedding': self.speed_embedding.state_dict(),
             'trajectory_queries': self.trajectory_queries.data,
             'trajectory_mlp': self.trajectory_mlp.state_dict(),
             'config': self.config,
@@ -408,8 +438,7 @@ class CoVLAAgentPaper(nn.Module):
         checkpoint = torch.load(path, map_location=self.config.device)
         
         self.vision_projection.load_state_dict(checkpoint['vision_projection'])
-        if checkpoint['speed_embedding'] and self.speed_embedding:
-            self.speed_embedding.load_state_dict(checkpoint['speed_embedding'])
+        self.speed_embedding.load_state_dict(checkpoint['speed_embedding'])
         self.trajectory_queries.data = checkpoint['trajectory_queries'].to(self.config.device)
         self.trajectory_mlp.load_state_dict(checkpoint['trajectory_mlp'])
         
@@ -459,7 +488,7 @@ class CoVLAAgentPaper(nn.Module):
         images: torch.Tensor,
         captions: Optional[List[str]] = None,
         trajectories: Optional[torch.Tensor] = None,
-        speeds: torch.Tensor = None,
+        ego_state: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass for both training and inference.
@@ -468,7 +497,7 @@ class CoVLAAgentPaper(nn.Module):
             images: (batch, 3, H, W) input images
             captions: Captions for sequence (GT during training, predicted/GT during inference)
             trajectories: Ground truth trajectories (batch, 10, 3) - only for training
-            speeds: Ego vehicle speeds (batch,) - REQUIRED
+            ego_state: (batch, D) where D=1 for speed only, D=3 for extended [vEgo, aEgo, steering]
         
         Training: captions = GT captions (for both trajectory conditioning and caption loss)
         Inference: captions = predicted (caption_mode="pred") or GT (caption_mode="gt")
@@ -484,9 +513,10 @@ class CoVLAAgentPaper(nn.Module):
         vision_embeds = self.vision_projection(vision_features)  # (batch, num_patches+1, llm_dim)
         num_vision_tokens = vision_embeds.shape[1]
         
-        # Speed embedding (paper: MLP that embeds ego vehicle speed) - 1 token
-        speed_input = speeds.unsqueeze(-1).float()  # (batch, 1)
-        speed_embeds = self.speed_embedding(speed_input)  # (batch, llm_dim)
+        # Ego state embedding - 1 token
+        # ego_state shape: (batch, 1) for speed only, (batch, 3) for extended
+        ego_input = ego_state.float()
+        speed_embeds = self.speed_embedding(ego_input)  # (batch, llm_dim)
         speed_embeds = speed_embeds.unsqueeze(1)  # (batch, 1, llm_dim)
         
         # Prepare text prompt (paper format from Figure 5)
@@ -510,7 +540,7 @@ class CoVLAAgentPaper(nn.Module):
         # During training: captions should be GT captions (passed explicitly)
         if captions is None:
             with torch.no_grad():
-                captions = self.generate_caption(images, speeds)
+                captions = self.generate_caption(images, ego_state)
         
         caption_inputs = self.tokenizer(
             captions,
@@ -597,16 +627,15 @@ class CoVLAAgentPaper(nn.Module):
     def generate_caption(
         self,
         images: torch.Tensor,
-        speeds: torch.Tensor,
+        ego_state: torch.Tensor,
         max_length: int = 100,
     ) -> List[str]:
         """
-        Generate driving scene captions conditioned on vision + speed.
+        Generate driving scene captions conditioned on vision + ego state.
         
-        This properly uses the image by:
-        1. Encoding image with CLIP
-        2. Projecting to LLM space
-        3. Using vision + speed tokens as prefix for generation
+        Args:
+            images: (B, C, H, W) batch of images
+            ego_state: (B, D) where D=1 for speed only, D=3 for extended [vEgo, aEgo, steering]
         """
         self.eval()
         device = images.device
@@ -617,8 +646,8 @@ class CoVLAAgentPaper(nn.Module):
         vision_features = self.encode_image(images)  # (B, num_patches, vision_dim)
         vision_embeds = self.vision_projection(vision_features).to(dtype)  # (B, num_patches, llm_dim)
         
-        # 2. Add speed embedding (layer is float32, convert output to dtype)
-        speed_embeds = self.speed_embedding(speeds.unsqueeze(-1).float().to(device))  # (B, llm_dim)
+        # 2. Add ego state embedding
+        speed_embeds = self.speed_embedding(ego_state.float().to(device))  # (B, llm_dim)
         speed_embeds = speed_embeds.to(dtype).unsqueeze(1)  # (B, 1, llm_dim)
         
         # 3. Use SAME prompt as training (must match forward())
@@ -662,7 +691,7 @@ class CoVLAAgentPaper(nn.Module):
     def predict(
         self, 
         image: torch.Tensor, 
-        speed: float,
+        ego_state: torch.Tensor,
         caption: str = None,
         caption_mode: str = "pred",
     ) -> Dict:
@@ -675,7 +704,7 @@ class CoVLAAgentPaper(nn.Module):
         
         Args:
             image: Input image tensor
-            speed: Ego vehicle speed in m/s (REQUIRED)
+            ego_state: (D,) ego state - D=1 for speed only, D=3 for extended [vEgo, aEgo, steering]
             caption: Ground truth caption (required if caption_mode="gt")
             caption_mode: How to use captions for trajectory prediction
                 - "pred": Generate caption first, use it for trajectory (default)
@@ -692,7 +721,13 @@ class CoVLAAgentPaper(nn.Module):
         
         device = next(self.parameters()).device
         image = image.to(device)
-        speeds = torch.tensor([speed], device=device)
+        
+        # Ensure ego_state is batched tensor
+        if not isinstance(ego_state, torch.Tensor):
+            ego_state = torch.tensor(ego_state, device=device)
+        if ego_state.dim() == 1:
+            ego_state = ego_state.unsqueeze(0)  # (D,) -> (1, D)
+        ego_state = ego_state.to(device)
         
         # Prepare caption based on mode
         if caption_mode == "gt":
@@ -700,12 +735,12 @@ class CoVLAAgentPaper(nn.Module):
                 raise ValueError("caption_mode='gt' requires caption to be provided")
             caption_for_trajectory = caption
         else:
-            # Pred caption mode: generate caption conditioned on image + speed
-            generated_captions = self.generate_caption(image, speeds)
+            # Pred caption mode: generate caption conditioned on image + ego_state
+            generated_captions = self.generate_caption(image, ego_state)
             caption_for_trajectory = generated_captions[0]
         
         # Get trajectory using the caption (either GT or predicted)
-        output = self.forward(image, captions=[caption_for_trajectory], speeds=speeds)
+        output = self.forward(image, captions=[caption_for_trajectory], ego_state=ego_state)
         trajectory = output['pred_trajectory'][0].cpu().numpy()
         
         return {
@@ -813,7 +848,7 @@ class CoVLATrainerPaper:
             images = batch['image'].to(self.device)
             trajectories = batch['trajectory'].to(self.device)
             captions = batch['caption']  # GT captions for both conditioning and loss
-            speeds = batch['speed'].to(self.device)
+            ego_state = batch['ego_state'].to(self.device)
             
             self.optimizer.zero_grad()
             
@@ -824,7 +859,7 @@ class CoVLATrainerPaper:
                         images, 
                         captions=captions,          # GT captions for trajectory conditioning
                         trajectories=trajectories,
-                        speeds=speeds,
+                        ego_state=ego_state,
                     )
                     loss = output['loss']
                 
@@ -836,7 +871,7 @@ class CoVLATrainerPaper:
                     images, 
                     captions=captions,
                     trajectories=trajectories,
-                    speeds=speeds,
+                    ego_state=ego_state,
                 )
                 loss = output['loss']
                 loss.backward()
@@ -892,8 +927,11 @@ class CoVLATrainerPaper:
         # Get first sample from batch
         gt_traj = batch['trajectory'][0].cpu().numpy()
         pred_traj = output['pred_trajectory'][0].detach().cpu().numpy()
-        speed = batch['speed'][0].item()
         caption = batch['caption'][0] if isinstance(batch['caption'], list) else batch['caption']
+        
+        # Get ego state and denormalize
+        ego_state_raw = batch['ego_state'][0].cpu().numpy()  # (3,) normalized
+        ego = denormalize_ego_state(ego_state_raw)
         
         # Get matrices - DataLoader collates as [row][col][batch_idx]
         extrinsic = np.array([[col[0].item() for col in row] for row in batch['extrinsic_matrix']])
@@ -916,8 +954,8 @@ class CoVLATrainerPaper:
         # Generate predicted caption
         with torch.no_grad():
             image_tensor = batch['image'][0:1].to(self.device)
-            speed_tensor = batch['speed'][0:1].to(self.device)
-            pred_caption = self.model.generate_caption(image_tensor, speed_tensor)[0]
+            ego_tensor = batch['ego_state'][0:1].to(self.device)
+            pred_caption = self.model.generate_caption(image_tensor, ego_tensor)[0]
         
         # Create figure
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -927,7 +965,8 @@ class CoVLATrainerPaper:
         plot_trajectory_on_image(frame, gt_traj, extrinsic, intrinsic, color='green', label='GT', ax=ax1)
         plot_trajectory_on_image(frame, pred_traj, extrinsic, intrinsic, color='red', label='Pred', ax=ax1)
         ax1.legend(loc='upper right')
-        ax1.set_title(f"Step {step} | ADE: {ade:.2f}m | FDE: {fde:.2f}m | Speed: {speed:.1f} m/s")
+        # Title with ego state info
+        ax1.set_title(f"Step {step} | ADE: {ade:.2f}m | FDE: {fde:.2f}m | {ego['vEgo']:.1f} m/s | Accel: {ego['aEgo']:.1f} | Steer: {ego['steeringAngleDeg']:.0f}°")
         
         # Right: Bird's eye view
         ax2 = axes[1]
@@ -965,11 +1004,9 @@ class CoVLATrainerPaper:
             images = batch['image'].to(self.device)
             trajectories = batch['trajectory'].to(self.device)
             captions = batch['caption']
-            speeds = batch.get('speed')
-            if speeds is not None:
-                speeds = speeds.to(self.device)
+            ego_state = batch['ego_state'].to(self.device)
             
-            output = self.model(images, captions=captions, trajectories=trajectories, speeds=speeds)
+            output = self.model(images, captions=captions, trajectories=trajectories, ego_state=ego_state)
             
             total_loss += output['loss'].item()
             all_pred.append(output['pred_trajectory'].cpu())
@@ -1096,7 +1133,7 @@ def load_model(path: str = "covla_trainable.pt", device: str = "cuda") -> CoVLAA
     
     Usage:
         model = load_model("covla_trainable.pt")
-        result = model.predict(image, speed=speed, caption_mode="pred")
+        result = model.predict(image, ego_state=ego_state, caption_mode="pred")
     """
     checkpoint = torch.load(path, map_location=device)
     config = checkpoint.get('config', CoVLAConfig(device=device))
@@ -1233,6 +1270,8 @@ def visualize_sample(
     if 'vEgo' not in state:
         raise KeyError(f"'vEgo' not found in state. Available keys: {list(state.keys())}")
     speed = state['vEgo']
+    aEgo = state.get('aEgo', None)
+    steer = state.get('steeringAngleDeg', None)
     
     # Get caption
     caption_text = caption.get('rich_caption', caption.get('plain_caption', 'No caption'))
@@ -1247,7 +1286,10 @@ def visualize_sample(
     # Left: Image with trajectory
     plot_trajectory_on_image(frame, trajectory, extrinsic, intrinsic, 
                              color='lime', label='GT Trajectory', ax=axes[0])
-    axes[0].set_title(f"idx={sample_idx} | {video_id}/{frame_name} | {speed:.1f} m/s")
+    title = f"idx={sample_idx} | {video_id}/{frame_name} | {speed:.1f} m/s"
+    if aEgo is not None and steer is not None:
+        title += f" | Accel: {aEgo:.1f} | Steer: {steer:.0f}°"
+    axes[0].set_title(title)
     axes[0].legend(loc='upper right')
     
     # Right: Bird's eye view
@@ -1264,7 +1306,11 @@ def visualize_sample(
     plt.show()
     
     # Print info
-    print(f"🚗 Speed: {speed:.1f} m/s")
+    print(f"🚗 Speed: {speed:.1f} m/s", end="")
+    if aEgo is not None and steer is not None:
+        print(f" | Accel: {aEgo:.1f} m/s² | Steer: {steer:.0f}°")
+    else:
+        print()
     print(f"📍 First 5 trajectory points (x, y, z):")
     for i, pt in enumerate(trajectory[:5]):
         print(f"   [{i}]: ({pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f})")
@@ -1306,8 +1352,11 @@ def visualize_dataset_sample(dataset, sample_idx: int):
     trajectory = sample['trajectory'].numpy() if hasattr(sample['trajectory'], 'numpy') else np.array(sample['trajectory'])
     extrinsic = sample['extrinsic_matrix'].numpy() if hasattr(sample['extrinsic_matrix'], 'numpy') else np.array(sample['extrinsic_matrix'])
     intrinsic = sample['intrinsic_matrix'].numpy() if hasattr(sample['intrinsic_matrix'], 'numpy') else np.array(sample['intrinsic_matrix'])
-    speed = sample['speed'].item() if hasattr(sample['speed'], 'item') else float(sample['speed'])
+    ego_state_raw = sample['ego_state'].numpy() if hasattr(sample['ego_state'], 'numpy') else np.array(sample['ego_state'])
     caption = sample.get('caption', 'No caption')
+    
+    # Denormalize ego state
+    ego = denormalize_ego_state(ego_state_raw)
     
     # Create figure
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
@@ -1315,7 +1364,7 @@ def visualize_dataset_sample(dataset, sample_idx: int):
     # Left: Image with trajectory
     plot_trajectory_on_image(frame, trajectory, extrinsic, intrinsic, 
                              color='lime', label='GT Trajectory', ax=axes[0])
-    axes[0].set_title(f"Dataset sample {sample_idx} | {speed:.1f} m/s")
+    axes[0].set_title(f"Dataset sample {sample_idx} | {ego['vEgo']:.1f} m/s | Accel: {ego['aEgo']:.1f} | Steer: {ego['steeringAngleDeg']:.0f}°")
     axes[0].legend(loc='upper right')
     
     # Right: Bird's eye view
@@ -1332,7 +1381,7 @@ def visualize_dataset_sample(dataset, sample_idx: int):
     plt.show()
     
     # Print info
-    print(f"🚗 Speed: {speed:.1f} m/s")
+    print(f"🚗 Speed: {ego['vEgo']:.1f} m/s | Accel: {ego['aEgo']:.1f} m/s² | Steer: {ego['steeringAngleDeg']:.0f}°")
     print(f"📍 First 5 trajectory points (x, y, z):")
     for i, pt in enumerate(trajectory[:5]):
         print(f"   [{i}]: ({pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f})")
@@ -1345,7 +1394,7 @@ def visualize_inference(
     gt_trajectory: np.ndarray,
     extrinsic_matrix: np.ndarray,
     intrinsic_matrix: np.ndarray,
-    speed: float,
+    ego_state: torch.Tensor,
     gt_caption: str = None,
     image_path: str = None,
     caption_mode: str = "pred",
@@ -1357,7 +1406,7 @@ def visualize_inference(
     """
     import matplotlib.pyplot as plt
     
-    result = model.predict(image, speed=speed, caption=gt_caption, caption_mode=caption_mode)
+    result = model.predict(image, ego_state=ego_state, caption=gt_caption, caption_mode=caption_mode)
     pred_traj = result['trajectory']
     pred_caption = result['caption']
     
@@ -1548,7 +1597,7 @@ def _predict_sample(model, sample, caption_mode="pred", debug=False):
     
     Returns:
         dict with: frame, gt_traj, pred_traj, extrinsic, intrinsic, 
-                   speed, gt_caption, pred_caption, ade, fde
+                   ego_state, gt_caption, pred_caption, ade, fde
     """
     device = next(model.parameters()).device
     
@@ -1557,14 +1606,14 @@ def _predict_sample(model, sample, caption_mode="pred", debug=False):
     gt_traj = _to_numpy(sample['trajectory'])
     extrinsic = _to_numpy(sample['extrinsic_matrix'])
     intrinsic = _to_numpy(sample['intrinsic_matrix'])
-    speed = sample['speed'].item() if hasattr(sample['speed'], 'item') else float(sample['speed'])
+    ego_state = sample['ego_state']  # (3,) tensor: [vEgo/30, aEgo/5, steering/500]
     gt_caption = sample.get('caption', '')
     
     # Run inference
     with torch.no_grad():
         result = model.predict(
             sample['image'].unsqueeze(0).to(device),
-            speed=speed,
+            ego_state=ego_state,
             caption=gt_caption if caption_mode == "gt" else None,
             caption_mode=caption_mode
         )
@@ -1575,13 +1624,16 @@ def _predict_sample(model, sample, caption_mode="pred", debug=False):
     ade = compute_ade(torch.tensor(pred_traj).unsqueeze(0), torch.tensor(gt_traj).unsqueeze(0))
     fde = compute_fde(torch.tensor(pred_traj).unsqueeze(0), torch.tensor(gt_traj).unsqueeze(0))
     
+    # Convert ego_state to numpy for display
+    ego_state_np = ego_state.numpy() if hasattr(ego_state, 'numpy') else np.array(ego_state)
+    
     return {
         'frame': frame,
         'gt_traj': gt_traj,
         'pred_traj': pred_traj,
         'extrinsic': extrinsic,
         'intrinsic': intrinsic,
-        'speed': speed,
+        'ego_state': ego_state_np,  # (3,) [vEgo/30, aEgo/5, steering/500] normalized
         'gt_caption': gt_caption,
         'pred_caption': pred_caption,
         'ade': ade,
@@ -1610,7 +1662,12 @@ def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
     plot_trajectory_on_image(r['frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
                              color='red', label='Pred', ax=ax1)
     ax1.legend(loc='upper right')
-    ax1.set_title(f"ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | Speed: {r['speed']:.1f} m/s")
+    
+    # Denormalize ego state
+    ego = denormalize_ego_state(r['ego_state'])
+    
+    # Title with ego state info
+    ax1.set_title(f"ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | {ego['vEgo']:.1f} m/s | Accel: {ego['aEgo']:.1f} | Steer: {ego['steeringAngleDeg']:.0f}°")
     
     # Right: Bird's eye view
     ax2 = axes[1]
@@ -1627,7 +1684,8 @@ def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
     plt.tight_layout()
     plt.show()
     
-    print(f"🚗 Speed: {r['speed']:.1f} m/s")
+    # Print ego state info
+    print(f"🚗 Speed: {ego['vEgo']:.1f} m/s | Accel: {ego['aEgo']:.1f} m/s² | Steer: {ego['steeringAngleDeg']:.0f}°")
     print(f"📝 Caption: {r['pred_caption'][:200]}...")
 
 
@@ -1676,7 +1734,10 @@ def generate_eval_images(
         plot_trajectory_on_image(r['frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
                                  color='red', label='Pred', ax=ax1)
         ax1.legend(loc='upper right')
-        ax1.set_title(f"Frame {i} | ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | Speed: {r['speed']:.1f} m/s")
+        
+        # Denormalize ego state
+        ego = denormalize_ego_state(r['ego_state'])
+        ax1.set_title(f"Frame {i} | ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | {ego['vEgo']:.1f} m/s | Accel: {ego['aEgo']:.1f} | Steer: {ego['steeringAngleDeg']:.0f}°")
         
         # Right: Bird's eye view
         ax2 = axes[1]
