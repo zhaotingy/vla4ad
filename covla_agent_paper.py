@@ -183,6 +183,22 @@ class CoVLADatasetPaper(Dataset):
             traj_indices = np.linspace(0, 59, config.trajectory_points, dtype=int)
             sampled_trajectory = [trajectory[j] for j in traj_indices]
             
+            # Filter corrupted trajectories
+            traj_array = np.array(sampled_trajectory)
+            
+            # Check 1: Absolute values (should be <200m in 3s horizon)
+            if np.any(np.abs(traj_array) > 200):
+                continue
+            
+            # Check 2: Delta between consecutive points
+            deltas = np.diff(traj_array, axis=0)  # (9, 3)
+            if np.any(np.abs(deltas) > 20):  # 20m per interval = ~67 m/s = 240 km/h
+                continue
+            
+            # Check 3: Lateral (y) delta - cars can't move sideways fast
+            if np.any(np.abs(deltas[:, 1]) > 5):  # Max 5m lateral per interval
+                continue
+            
             # Get caption
             caption_idx = min(i // sample_interval, len(captions_data) - 1)
             caption = captions_data[caption_idx] if captions_data else {}
@@ -1006,7 +1022,8 @@ class CoVLATrainerPaper:
             captions = batch['caption']
             ego_state = batch['ego_state'].to(self.device)
             
-            output = self.model(images, captions=captions, trajectories=trajectories, ego_state=ego_state)
+            output = self.model(images, captions=captions, trajectories=trajectories, 
+                              ego_state=ego_state)
             
             total_loss += output['loss'].item()
             all_pred.append(output['pred_trajectory'].cpu())
@@ -1666,7 +1683,7 @@ def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
     # Denormalize ego state
     ego = denormalize_ego_state(r['ego_state'])
     
-    # Title with ego state info
+    # Title with metrics
     ax1.set_title(f"ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | {ego['vEgo']:.1f} m/s | Accel: {ego['aEgo']:.1f} | Steer: {ego['steeringAngleDeg']:.0f}°")
     
     # Right: Bird's eye view
