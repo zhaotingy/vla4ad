@@ -296,7 +296,6 @@ class TrajectoryMLP(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.2),
             nn.Linear(hidden_dim, coord_dim),  # Output 3 coords per query
         )
     
@@ -829,6 +828,7 @@ class CoVLATrainerPaper:
         # Optimizer
         trainable = [p for p in model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(trainable, lr=config.learning_rate)
+        self.scheduler = None  # Will be set in train()
         
         # Mixed precision
         self.scaler = torch.cuda.amp.GradScaler() if config.device == "cuda" else None
@@ -942,7 +942,15 @@ class CoVLATrainerPaper:
         
         # Get first sample from batch
         gt_traj = batch['trajectory'][0].cpu().numpy()
-        pred_traj = output['pred_trajectory'][0].detach().cpu().numpy()
+        
+        # Re-compute prediction in eval mode (training output has dropout noise)
+        with torch.no_grad():
+            eval_output = self.model(
+                batch['image'][0:1].to(self.device),
+                captions=[batch['caption'][0]],
+                ego_state=batch['ego_state'][0:1].to(self.device),
+            )
+        pred_traj = eval_output['pred_trajectory'][0].cpu().numpy()
         caption = batch['caption'][0] if isinstance(batch['caption'], list) else batch['caption']
         
         # Get ego state and denormalize
@@ -1001,8 +1009,8 @@ class CoVLATrainerPaper:
         plt.close(fig)
         
         # Print captions
-        print(f"📝 GT:   {caption[:300]}...")
-        print(f"🤖 Pred: {pred_caption[:300]}...")
+        print(f"📝 GT:   {caption[:500]}...")
+        print(f"🤖 Pred: {pred_caption[:500]}...")
         
         self.model.train()
     
@@ -1067,6 +1075,12 @@ class CoVLATrainerPaper:
                 shuffle=False,
             )
         
+        # Cosine annealing LR scheduler (decays LR from initial to 1/3 of initial)
+        eta_min = self.config.learning_rate / 3
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=num_epochs, eta_min=eta_min
+        )
+        
         # Store training info for reprinting after clear_output
         self._training_info = [
             "",
@@ -1077,6 +1091,7 @@ class CoVLATrainerPaper:
             f"Val samples: {len(val_dataset)}" if val_dataset else None,
             f"Epochs: {num_epochs}",
             f"Batch size: {self.config.batch_size}",
+            f"Learning rate: {self.config.learning_rate} → {self.config.learning_rate/3:.1e} (cosine decay)",
             f"Loss weights: caption={self.config.caption_weight}, trajectory={self.config.trajectory_weight}",
             "=" * 70,
             "",
@@ -1129,6 +1144,9 @@ class CoVLATrainerPaper:
             
             # Save checkpoint each epoch
             self.model.save_trainable(f"covla_epoch_{epoch+1}.pt")
+            
+            # Step LR scheduler
+            self.scheduler.step()
         
         print("\n✓ Training complete!")
         
@@ -1714,14 +1732,18 @@ def generate_eval_images(
     num_frames: int = 50,
     caption_mode: str = "pred",
     show_gt: bool = True,
+    generate_video: bool = True,
+    fps: int = 3,
 ):
     """
     Generate evaluation images with trajectory overlay + bird's eye view + captions.
+    Optionally generates a video from the images.
     
     Usage:
         generate_eval_images(model, val_dataset, "eval", num_frames=30)
+        generate_eval_images(model, val_dataset, "eval", num_frames=30, generate_video=True, fps=5)
     
-    Output: eval/0000.png, eval/0001.png, ...
+    Output: eval/0000.png, eval/0001.png, ... and eval/eval.mp4 (if generate_video=True)
     """
     import matplotlib.pyplot as plt
     from tqdm import tqdm
@@ -1732,6 +1754,7 @@ def generate_eval_images(
     model.eval()
     
     metrics = []
+    saved_images = []
     
     for i in tqdm(range(start_idx, end_idx), desc="Processing"):
         sample = dataset[i]
@@ -1771,22 +1794,44 @@ def generate_eval_images(
         plt.tight_layout()
         
         # Add captions as text below the figure
-        gt_text = f"GT: {gt_caption[:300]}..." if len(gt_caption) > 300 else f"GT: {gt_caption}"
-        pred_text = f"Pred: {r['pred_caption'][:300]}..." if len(r['pred_caption']) > 300 else f"Pred: {r['pred_caption']}"
+        gt_text = f"GT: {gt_caption[:500]}..." if len(gt_caption) > 500 else f"GT: {gt_caption}"
+        pred_text = f"Pred: {r['pred_caption'][:500]}..." if len(r['pred_caption']) > 500 else f"Pred: {r['pred_caption']}"
         
-        fig.text(0.02, 0.02, gt_text, fontsize=9, color='green', wrap=True)
-        fig.text(0.02, -0.03, pred_text, fontsize=9, color='red', wrap=True)
+        # Adjust layout first to make room for captions (bottom) and title (top)
+        plt.subplots_adjust(bottom=0.22, top=0.92)
         
-        # Adjust layout to make room for captions
-        plt.subplots_adjust(bottom=0.15)
+        # Place captions in the margin area (y in figure coordinates, 0=bottom, 1=top)
+        fig.text(0.02, 0.12, gt_text, fontsize=9, color='green', wrap=True)
+        fig.text(0.02, 0.02, pred_text, fontsize=9, color='red', wrap=True)
         
-        # Save
-        plt.savefig(f"{output_dir}/{i-start_idx:04d}.png", dpi=120, bbox_inches='tight')
+        # Save (no bbox_inches='tight' to ensure consistent image sizes for video)
+        img_path = f"{output_dir}/{i-start_idx:04d}.png"
+        plt.savefig(img_path, dpi=120)
         plt.close(fig)
+        saved_images.append(img_path)
     
     avg_ade = np.mean([m['ade'] for m in metrics])
     avg_fde = np.mean([m['fde'] for m in metrics])
     print(f"✅ Saved {len(metrics)} images to {output_dir}/ | ADE: {avg_ade:.3f}m, FDE: {avg_fde:.3f}m")
+    
+    # Generate video from saved images
+    if generate_video and saved_images:
+        try:
+            import imageio
+            video_path = f"{output_dir}/eval.mp4"
+            
+            # Read images and write video
+            writer = imageio.get_writer(video_path, fps=fps, codec='libx264', quality=8)
+            for img_path in saved_images:
+                frame = imageio.imread(img_path)
+                writer.append_data(frame)
+            writer.close()
+            
+            print(f"🎬 Generated video: {video_path} ({len(saved_images)} frames @ {fps} fps)")
+        except ImportError:
+            print("⚠️ imageio not installed. Run: pip install imageio imageio-ffmpeg")
+        except Exception as e:
+            print(f"⚠️ Video generation failed: {e}")
     print(f"📹 To create video: ffmpeg -framerate 2 -i {output_dir}/%04d.png -c:v libx264 -pix_fmt yuv420p output.mp4")
     return {'output_dir': output_dir, 'num_frames': len(metrics), 'avg_ade': avg_ade, 'avg_fde': avg_fde}
 
