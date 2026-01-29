@@ -112,10 +112,10 @@ class CoVLAConfig:
     trajectory_weight: float = 0.5
     smoothing_weight: float = 0.1  # Smoothing loss to reduce trajectory wobble
     
-    # Data split (paper: 70/15/15)
-    train_ratio: float = 0.70
-    val_ratio: float = 0.15
-    test_ratio: float = 0.15
+    # Data split (80/20, no test)
+    train_ratio: float = 0.80
+    val_ratio: float = 0.20
+    test_ratio: float = 0.0
     
     # Frame sampling (paper: 2Hz)
     frame_sample_rate: int = 2  # Hz
@@ -223,7 +223,7 @@ class CoVLADatasetPaper(Dataset):
                 'intrinsic_matrix': state['intrinsic_matrix'],
             })
         
-        # Split data (70/15/15 as per paper)
+        # Split data (80/20 train/val)
         n = len(self.samples)
         train_end = int(n * config.train_ratio)
         val_end = train_end + int(n * config.val_ratio)
@@ -296,6 +296,7 @@ class TrajectoryMLP(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
+            # nn.Dropout(0.2),
             nn.Linear(hidden_dim, coord_dim),  # Output 3 coords per query
         )
     
@@ -1756,7 +1757,7 @@ def generate_eval_images(
     metrics = []
     saved_images = []
     
-    for i in tqdm(range(start_idx, end_idx), desc="Processing"):
+    for i in tqdm(range(start_idx, end_idx), desc="Processing", mininterval=5.0):
         sample = dataset[i]
         r = _predict_sample(model, sample, caption_mode)
         metrics.append({'ade': r['ade'], 'fde': r['fde']})
@@ -1832,6 +1833,5 @@ def generate_eval_images(
             print("⚠️ imageio not installed. Run: pip install imageio imageio-ffmpeg")
         except Exception as e:
             print(f"⚠️ Video generation failed: {e}")
-    print(f"📹 To create video: ffmpeg -framerate 2 -i {output_dir}/%04d.png -c:v libx264 -pix_fmt yuv420p output.mp4")
     return {'output_dir': output_dir, 'num_frames': len(metrics), 'avg_ade': avg_ade, 'avg_fde': avg_fde}
 
