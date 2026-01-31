@@ -117,6 +117,13 @@ class CoVLAConfig:
     val_ratio: float = 0.20
     test_ratio: float = 0.0
     
+    # Data augmentation (only applied during training)
+    augment_trajectory: bool = True  # Add noise to GT trajectory
+    augment_ego_state: bool = True   # Add noise to ego state
+    augment_image: bool = True       # Color jitter on images
+    trajectory_noise_std: float = 0.05  # meters
+    ego_state_noise_std: float = 0.02   # relative (2%)
+    
     # Frame sampling (paper: 2Hz)
     frame_sample_rate: int = 2  # Hz
     
@@ -235,11 +242,20 @@ class CoVLADatasetPaper(Dataset):
         else:  # test
             self.samples = self.samples[val_end:]
         
-        self.transform = transforms.Compose([
-            transforms.Resize((config.image_size, config.image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
+        # Image transforms: add color jitter for training augmentation
+        if split == "train" and config.augment_image:
+            self.transform = transforms.Compose([
+                transforms.Resize((config.image_size, config.image_size)),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((config.image_size, config.image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ])
         
         print(f"✓ {split.upper()} set: {len(self.samples)} samples")
     
@@ -261,6 +277,16 @@ class CoVLADatasetPaper(Dataset):
         
         # Ego state: [vEgo/30, aEgo/5, steering/500] normalized
         ego_state = torch.tensor(sample['ego_state'], dtype=torch.float32)
+        
+        # Data augmentation (training only)
+        if self.split == "train":
+            # Trajectory noise (small Gaussian, ~5cm std)
+            if self.config.augment_trajectory:
+                trajectory = trajectory + torch.randn_like(trajectory) * self.config.trajectory_noise_std
+            
+            # Ego state noise (relative, ~2%)
+            if self.config.augment_ego_state:
+                ego_state = ego_state * (1 + torch.randn_like(ego_state) * self.config.ego_state_noise_std)
         
         return {
             'image': image,

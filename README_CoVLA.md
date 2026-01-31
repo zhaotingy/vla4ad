@@ -5,6 +5,25 @@
 - [turing-motors/CoVLA-Dataset](https://huggingface.co/datasets/turing-motors/CoVLA-Dataset) - Full (10,000 videos, ~12GB states)
 - [turing-motors/CoVLA-Dataset-Mini](https://huggingface.co/datasets/turing-motors/CoVLA-Dataset-Mini) - Mini (subset)
 
+## Quick Start
+
+```python
+from covla_agent_paper import *
+
+# Load data (see Colab Tutorial below for data setup)
+config = CoVLAConfig(device="cuda", use_paper_model=True)
+train_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="train")
+val_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="val")
+
+# Train
+model = CoVLAAgentPaper(config)
+trainer = CoVLATrainerPaper(model, config)
+history = trainer.train(train_dataset, val_dataset, num_epochs=4)
+
+# Evaluate
+generate_eval_images(model, val_dataset, "eval", num_frames=100)
+```
+
 ---
 
 ## Files
@@ -58,28 +77,83 @@ CoVLA-Agent is a Vision-Language-Action model that:
 
 ### Architecture (from paper)
 ```
-Image → CLIP ViT-L/14 → Projection ─┐
-                                    ├→ Llama-2 7B → Trajectory MLP → 10 (x,y,z) points
-Speed → Speed MLP ──────────────────┘            → Caption Generation
+Image → CLIP ViT-L/14 → Projection ──────────┐
+                                             ├→ Mistral 7B → Trajectory MLP → 10 (x,y,z) points
+Ego State → Linear Embedding ────────────────┘            → Caption Generation
+[vEgo, aEgo, steering]
 ```
 
-**Paper Models:**
-- **Vision Encoder**: CLIP ViT-L/14 (768-dim features)
-- **Language Model**: Llama-2 7B (we use Mistral 7B as open alternative)
-- **Speed Embedding**: MLP that embeds ego vehicle speed
+**Models:**
+- **Vision Encoder**: CLIP ViT-L/14 (frozen, 768-dim features)
+- **Language Model**: Mistral 7B with LoRA fine-tuning
+- **Ego State**: Linear embedding of [speed, acceleration, steering angle]
 
 ### Training (Section 4)
 - **Loss**: `0.5 × Caption_CE + 0.5 × Trajectory_MSE`
 - **Trajectory**: 10 points uniformly sampled from 60 (3-second horizon)
 - **Frame sampling**: 2Hz
-- **Split**: 70% train / 15% val / 15% test
-- **Training samples**: 302,989
+- **Split**: 80% train / 20% val (configurable)
+- **Learning rate**: 2e-5 with cosine decay to 1/3 of original
+- **Data augmentation**: Image color jitter, trajectory noise, ego state noise
 
-### Results (from paper)
-| Setting | ADE | FDE |
-|---------|-----|-----|
-| Predicted captions | 0.955 | 2.239 |
-| GT captions | 0.814 | 1.655 |
+### Results
+| Setting | ADE | FDE | Notes |
+|---------|-----|-----|-------|
+| Paper (pred captions) | 0.955 | 2.239 | Baseline |
+| Paper (GT captions) | 0.814 | 1.655 | Oracle |
+| **Our best (6k clips)** | **0.724** | **1.774** | With augmentation |
+
+---
+
+## Configuration Options
+
+### CoVLAConfig Parameters
+
+```python
+config = CoVLAConfig(
+    # Model selection
+    use_paper_model=True,        # True: CLIP ViT-L + Mistral 7B, False: lightweight
+    
+    # Training
+    learning_rate=2e-5,          # Initial LR (cosine decay to 1/3)
+    batch_size=8,                # Reduce if OOM
+    num_epochs=10,
+    
+    # Data split
+    train_ratio=0.80,            # 80% train
+    val_ratio=0.20,              # 20% val
+    test_ratio=0.0,              # No test set
+    
+    # Data augmentation (training only)
+    augment_trajectory=True,     # Gaussian noise on GT trajectory
+    augment_ego_state=True,      # Multiplicative noise on ego state
+    augment_image=True,          # Color jitter (brightness, contrast, saturation)
+    trajectory_noise_std=0.05,   # 5cm std
+    ego_state_noise_std=0.02,    # 2% relative noise
+    
+    # Loss weights
+    caption_weight=0.5,
+    trajectory_weight=0.5,
+    smoothing_weight=0.1,        # Penalize trajectory acceleration
+    
+    # Ego state
+    use_extended_ego_state=True, # Use [vEgo, aEgo, steering] instead of just speed
+    
+    # LoRA fine-tuning
+    use_lora=True,
+    lora_rank=16,
+)
+```
+
+### Data Augmentation
+
+| Type | Augmentation | Default | Effect |
+|------|--------------|---------|--------|
+| **Image** | ColorJitter | On | Robustness to lighting |
+| **Trajectory** | Gaussian noise (σ=5cm) | On | Prevents overfitting |
+| **Ego state** | Multiplicative (2%) | On | Sensor noise robustness |
+
+Augmentation only applies to training set; validation stays clean.
 
 ---
 
@@ -757,9 +831,14 @@ from covla_agent_paper import *
 # ============================================================
 config = CoVLAConfig(
     device="cuda",
-    use_paper_model=True,   # CLIP ViT-L + Llama-2 7B
-    use_speed_embedding=True,
-    batch_size=4,           # Reduce if OOM (default: 8)
+    use_paper_model=True,      # CLIP ViT-L + Mistral 7B
+    batch_size=4,              # Reduce if OOM (default: 8)
+    learning_rate=2e-5,        # Cosine decay to 1/3 of this
+    
+    # Data augmentation (helps prevent overfitting)
+    augment_trajectory=True,   # Add noise to GT trajectory
+    augment_ego_state=True,    # Add noise to ego state
+    augment_image=True,        # Color jitter
 )
 
 # ============================================================
@@ -769,8 +848,7 @@ config = CoVLAConfig(
 # config = CoVLAConfig(
 #     device="cuda",
 #     use_paper_model=False,  # CLIP ViT-B + TinyLlama 1.1B
-#     use_speed_embedding=True,
-#     batch_size=4,           # Reduce if OOM (default: 8)
+#     batch_size=4,
 # )
 
 # Create datasets
@@ -781,8 +859,9 @@ val_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, spli
 model = CoVLAAgentPaper(config)
 
 # Train (auto-saves after each epoch)
+# Learning rate: cosine decay from 2e-5 to 6.7e-6
 trainer = CoVLATrainerPaper(model, config)
-history = trainer.train(train_dataset, val_dataset, num_epochs=10)
+history = trainer.train(train_dataset, val_dataset, num_epochs=4)
 
 # Saves automatically:
 # - covla_epoch_1.pt, covla_epoch_2.pt, ... (each epoch)
@@ -845,7 +924,7 @@ plot_training_curves(history)
 sample = val_dataset[0]
 result = model.predict(
     sample['image'], 
-    speed=sample['speed'],  # REQUIRED
+    ego_state=sample['ego_state'],  # [vEgo/30, aEgo/5, steering/500] normalized
     caption_mode="pred",  # Generate caption, use for trajectory (default)
     # caption_mode="gt", caption=sample.get('caption'),  # Or use GT caption (better ADE)
 )
@@ -872,26 +951,30 @@ for idx in [0, 10, 20]:
         visualize(model, val_dataset, idx)
 ```
 
-### Cell 10: Generate Video
+### Cell 10: Generate Evaluation Images and Video
 ```python
-from covla_agent_paper import generate_video
+from covla_agent_paper import generate_eval_images
 
-generate_video(
+# Generate images with automatic video creation
+generate_eval_images(
     model, 
     val_dataset, 
-    output_path="demo.mp4", 
-    num_frames=30,          # Number of frames
-    fps=2,                  # Output FPS
+    output_dir="eval",      # Output directory
+    num_frames=100,         # Number of frames to evaluate
     caption_mode="pred",    # "pred" or "gt"
-    show_gt=True,           # Show GT trajectory (green)
+    generate_video=True,    # Also create eval.mp4
+    fps=3,                  # Video FPS
 )
+# Output: eval/0000.png, eval/0001.png, ..., eval/eval.mp4
 ```
 
-**Output video shows:**
+**Output shows:**
 - 🟢 Green: Ground truth trajectory
 - 🔴 Red: Predicted trajectory  
-- Top-left: Speed, ADE/FDE metrics
-- Bottom: Generated caption
+- Left panel: Camera view with trajectory overlay
+- Right panel: Bird's eye view
+- Top: Speed, acceleration, steering, ADE/FDE metrics
+- Bottom: GT caption (green) and predicted caption (red)
 
 ---
 
