@@ -172,18 +172,31 @@ class CoVLADatasetPaper(Dataset):
         # Sample at 2Hz (every 10th frame from 20Hz data)
         sample_interval = 20 // config.frame_sample_rate  # = 10
         
-        # Filter and prepare samples
+        # Filter and prepare samples with logging
         self.samples = []
+        self.physics_mismatch_indices = []  # Store indices for debugging
+        filter_counts = {
+            'total_candidates': 0,
+            'incomplete_trajectory': 0,
+            'absolute_too_large': 0,
+            'delta_too_large': 0,
+            'lateral_delta_too_large': 0,
+            'physics_mismatch': 0,
+            'no_imu_data': 0,
+            'passed': 0,
+        }
         
         for i in range(0, len(states_data), sample_interval):
             if i >= len(image_files):
                 break
-                
+            
+            filter_counts['total_candidates'] += 1
             state = states_data[i]
             trajectory = state.get('trajectory', [])
             
             # Paper: "excluding those lacking complete trajectory data for subsequent 3 seconds"
             if len(trajectory) < 60:
+                filter_counts['incomplete_trajectory'] += 1
                 continue
             
             # Uniformly sample 10 points from 60 (paper specification)
@@ -195,16 +208,77 @@ class CoVLADatasetPaper(Dataset):
             
             # Check 1: Absolute values (should be <200m in 3s horizon)
             if np.any(np.abs(traj_array) > 200):
+                filter_counts['absolute_too_large'] += 1
                 continue
             
             # Check 2: Delta between consecutive points
             deltas = np.diff(traj_array, axis=0)  # (9, 3)
             if np.any(np.abs(deltas) > 20):  # 20m per interval = ~67 m/s = 240 km/h
+                filter_counts['delta_too_large'] += 1
                 continue
             
             # Check 3: Lateral (y) delta - cars can't move sideways fast
             if np.any(np.abs(deltas[:, 1]) > 5):  # Max 5m lateral per interval
+                filter_counts['lateral_delta_too_large'] += 1
                 continue
+            
+            # Check 4: Physics-based trajectory validation using IMU yaw rate
+            final_x = traj_array[-1, 0]  # Actual forward distance (meters)
+            final_y = traj_array[-1, 1]  # Actual lateral distance (meters, signed)
+            
+            # Note: final_x can be negative for sharp turns (U-turn, 90° turn)
+            # The physics simulation will validate if the trajectory matches sensor data
+            angular_vel = state.get('angular_velocities_calib', None)
+            trajectory_physics = None  # Simulated trajectory from physics model
+            
+            if angular_vel is not None and len(angular_vel) >= 3:
+                raw_speed = state['vEgo']  # m/s
+                raw_accel = state.get('aEgo', 0.0)  # m/s²
+                # Yaw rate from IMU: [2] = rotation around vertical axis
+                # In standard coords: negative yaw_rate = turning right (clockwise from above)
+                # Our Y+ = right, so we negate to get correct lateral direction
+                yaw_rate = -angular_vel[2]
+                
+                # Simulate trajectory over 3 seconds, sample 10 points to match GT
+                dt = 0.1
+                sim_x, sim_y, sim_heading = 0.0, 0.0, 0.0
+                sim_v = raw_speed
+                sim_points = []
+                sim_1s = None  # Position at 1 second for validation
+                
+                for step in range(30):  # 30 steps × 0.1s = 3s
+                    sim_v = max(0, sim_v + raw_accel * dt)
+                    sim_heading += yaw_rate * dt
+                    sim_x += sim_v * np.cos(sim_heading) * dt
+                    sim_y += sim_v * np.sin(sim_heading) * dt
+                    
+                    # Save position at 1 second (step 10)
+                    if step == 9:
+                        sim_1s = (sim_x, sim_y)
+                    
+                    # Sample at same intervals as GT (every 3rd step for 10 points)
+                    if (step + 1) % 3 == 0:
+                        sim_points.append([sim_x, sim_y, 0.0])  # z=0 for ground plane
+                
+                trajectory_physics = sim_points  # 10 points [(x, y, z), ...]
+                
+                # Compare at 1 second (more reliable than 3s where errors accumulate)
+                # GT point 3 ≈ 1 second (10 points over 3s, so point 3 = 0.9s)
+                gt_1s = traj_array[3]  # (x, y, z) at ~1 second
+                
+                # Tolerance: min 3m base + 50% of distance (relaxed)
+                dist_1s = np.sqrt(sim_1s[0]**2 + sim_1s[1]**2) if sim_1s else 0
+                tolerance = max(3.0, dist_1s * 0.5)
+                
+                error_1s = np.sqrt((gt_1s[0] - sim_1s[0])**2 + (gt_1s[1] - sim_1s[1])**2) if sim_1s else 0
+                gt_dist_1s = np.sqrt(gt_1s[0]**2 + gt_1s[1]**2)
+                
+                if error_1s > tolerance and gt_dist_1s > 2:  # Only check if moved >2m in 1s
+                    filter_counts['physics_mismatch'] += 1
+                    self.physics_mismatch_indices.append(i)
+                    continue
+            else:
+                filter_counts['no_imu_data'] += 1
             
             # Get caption
             caption_idx = min(i // sample_interval, len(captions_data) - 1)
@@ -221,14 +295,31 @@ class CoVLADatasetPaper(Dataset):
                 state.get('steeringAngleDeg', 0.0),
             )
             
+            filter_counts['passed'] += 1
             self.samples.append({
                 'image_path': image_files[i],
                 'trajectory': sampled_trajectory,
+                'trajectory_physics': trajectory_physics,  # Simulated from IMU (10 points or None)
                 'caption': caption.get('rich_caption', caption.get('plain_caption', '')),
                 'ego_state': ego_state,  # [vEgo/30, aEgo/5, steering/500] normalized
                 'extrinsic_matrix': state['extrinsic_matrix'],
                 'intrinsic_matrix': state['intrinsic_matrix'],
             })
+        
+        # Print filter summary
+        total = filter_counts['total_candidates']
+        passed = filter_counts['passed']
+        filtered = total - passed
+        print(f"\n📊 Data filtering summary:")
+        print(f"   Total candidates: {total}")
+        print(f"   ├─ Incomplete trajectory: {filter_counts['incomplete_trajectory']}")
+        print(f"   ├─ Absolute value >200m: {filter_counts['absolute_too_large']}")
+        print(f"   ├─ Delta >20m: {filter_counts['delta_too_large']}")
+        print(f"   ├─ Lateral delta >5m: {filter_counts['lateral_delta_too_large']}")
+        print(f"   ├─ Physics mismatch: {filter_counts['physics_mismatch']}")
+        print(f"   └─ No IMU data (kept): {filter_counts['no_imu_data']}")
+        print(f"   ✓ Passed: {passed} ({100*passed/total:.1f}%)")
+        print(f"   ✗ Filtered: {filtered} ({100*filtered/total:.1f}%)")
         
         # Split data (80/20 train/val)
         n = len(self.samples)
@@ -288,9 +379,15 @@ class CoVLADatasetPaper(Dataset):
             if self.config.augment_ego_state:
                 ego_state = ego_state * (1 + torch.randn_like(ego_state) * self.config.ego_state_noise_std)
         
+        # Physics-based simulated trajectory (for visualization/debugging)
+        traj_physics = sample.get('trajectory_physics')
+        if traj_physics is not None:
+            traj_physics = torch.tensor(traj_physics, dtype=torch.float32)  # (10, 3)
+        
         return {
             'image': image,
             'trajectory': trajectory,
+            'trajectory_physics': traj_physics,  # (10, 3) or None - simulated from IMU
             'caption': sample['caption'],
             'ego_state': ego_state,  # (3,) [vEgo/30, aEgo/5, steering/500] normalized
             'extrinsic_matrix': sample.get('extrinsic_matrix'),
@@ -1658,7 +1755,7 @@ def _predict_sample(model, sample, caption_mode="pred", debug=False):
     Run inference on a dataset sample. Returns dict with all needed data.
     
     Returns:
-        dict with: frame, gt_traj, pred_traj, extrinsic, intrinsic, 
+        dict with: frame, gt_traj, pred_traj, trajectory_physics, extrinsic, intrinsic, 
                    ego_state, gt_caption, pred_caption, ade, fde
     """
     device = next(model.parameters()).device
@@ -1670,6 +1767,11 @@ def _predict_sample(model, sample, caption_mode="pred", debug=False):
     intrinsic = _to_numpy(sample['intrinsic_matrix'])
     ego_state = sample['ego_state']  # (3,) tensor: [vEgo/30, aEgo/5, steering/500]
     gt_caption = sample.get('caption', '')
+    
+    # Physics-based trajectory (from IMU simulation)
+    traj_physics = sample.get('trajectory_physics')
+    if traj_physics is not None:
+        traj_physics = _to_numpy(traj_physics)  # (10, 3)
     
     # Run inference
     with torch.no_grad():
@@ -1693,6 +1795,7 @@ def _predict_sample(model, sample, caption_mode="pred", debug=False):
         'frame': frame,
         'gt_traj': gt_traj,
         'pred_traj': pred_traj,
+        'trajectory_physics': traj_physics,  # (10, 3) or None - simulated from IMU
         'extrinsic': extrinsic,
         'intrinsic': intrinsic,
         'ego_state': ego_state_np,  # (3,) [vEgo/30, aEgo/5, steering/500] normalized
@@ -1713,7 +1816,11 @@ def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
     """
     import matplotlib.pyplot as plt
     
-    r = _predict_sample(model, dataset[idx], caption_mode)
+    sample = dataset[idx]
+    r = _predict_sample(model, sample, caption_mode)
+    
+    # Get physics trajectory from prediction result
+    traj_physics = r.get('trajectory_physics')  # (10, 3) or None
     
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     
@@ -1723,6 +1830,12 @@ def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
                              color='green', label='GT', ax=ax1)
     plot_trajectory_on_image(r['frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
                              color='red', label='Pred', ax=ax1)
+    
+    # Plot physics trajectory on image if available
+    if traj_physics is not None:
+        plot_trajectory_on_image(r['frame'], traj_physics, r['extrinsic'], r['intrinsic'], 
+                                 color='blue', label='Physics', ax=ax1)
+    
     ax1.legend(loc='upper right')
     
     # Denormalize ego state
@@ -1735,6 +1848,12 @@ def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
     ax2 = axes[1]
     ax2.plot(r['gt_traj'][:, 0], r['gt_traj'][:, 1], 'g-o', markersize=5, label='GT')
     ax2.plot(r['pred_traj'][:, 0], r['pred_traj'][:, 1], 'r-o', markersize=5, label='Pred')
+    
+    # Plot physics trajectory in bird's eye view
+    if traj_physics is not None:
+        ax2.plot(traj_physics[:, 0], traj_physics[:, 1], 'b-s', markersize=4, 
+                 label='Physics (IMU)', alpha=0.7, linewidth=1.5)
+    
     ax2.scatter([0], [0], c='blue', s=100, marker='*', label='Ego', zorder=5)
     ax2.set_xlabel('Forward (m)')
     ax2.set_ylabel('Lateral (m)')
@@ -1749,6 +1868,8 @@ def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
     # Print ego state info
     print(f"🚗 Speed: {ego['vEgo']:.1f} m/s | Accel: {ego['aEgo']:.1f} m/s² | Steer: {ego['steeringAngleDeg']:.0f}°")
     print(f"📝 Caption: {r['pred_caption'][:200]}...")
+    if traj_physics is not None:
+        print(f"📐 Physics trajectory available (10 points from IMU yaw rate)")
 
 
 def generate_eval_images(
@@ -1860,4 +1981,152 @@ def generate_eval_images(
         except Exception as e:
             print(f"⚠️ Video generation failed: {e}")
     return {'output_dir': output_dir, 'num_frames': len(metrics), 'avg_ade': avg_ade, 'avg_fde': avg_fde}
+
+
+def find_worst_predictions(
+    model,
+    dataset,
+    output_dir: str = "worst_predictions",
+    num_worst: int = 200,
+    caption_mode: str = "pred",
+    batch_size: int = 16,
+):
+    """
+    Find and save the worst ADE predictions for error analysis.
+    Uses batched inference for speed.
+    
+    Usage:
+        results = find_worst_predictions(model, val_dataset, num_worst=200)
+        results = find_worst_predictions(model, val_dataset, num_worst=200, batch_size=32)
+    
+    Output files: worst_predictions/0000_ade5.23_idx1234.png (ranked by ADE, worst first)
+    """
+    import matplotlib.pyplot as plt
+    from tqdm import tqdm
+    from torch.utils.data import DataLoader
+    
+    os.makedirs(output_dir, exist_ok=True)
+    model.eval()
+    device = next(model.parameters()).device
+    
+    # Create dataloader for batched inference
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    
+    # Evaluate all samples in batches
+    print(f"Evaluating {len(dataset)} samples (batch_size={batch_size})...")
+    all_ade_fde = []  # Store (idx, ade, fde) for all samples
+    
+    sample_idx = 0
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Computing ADE", mininterval=120.0):
+            images = batch['image'].to(device)
+            trajectories = batch['trajectory'].to(device)
+            captions = batch['caption'] if caption_mode == "gt" else None
+            ego_state = batch['ego_state'].to(device)
+            
+            # Forward pass
+            output = model(images, captions=captions, ego_state=ego_state)
+            
+            pred_trajs = output['pred_trajectory'].cpu()  # (B, 10, 3)
+            gt_trajs = trajectories.cpu()  # (B, 10, 3)
+            
+            # Compute ADE/FDE for each sample in batch
+            for i in range(len(images)):
+                ade = compute_ade(pred_trajs[i:i+1], gt_trajs[i:i+1])
+                fde = compute_fde(pred_trajs[i:i+1], gt_trajs[i:i+1])
+                all_ade_fde.append({
+                    'idx': sample_idx,
+                    'ade': ade,
+                    'fde': fde,
+                })
+                sample_idx += 1
+    
+    # Sort by ADE (worst first) and get top N indices
+    all_ade_fde.sort(key=lambda x: x['ade'], reverse=True)
+    
+    actual_num_worst = min(num_worst, len(all_ade_fde))
+    print(f"\nWorst {actual_num_worst} ADE range: {all_ade_fde[actual_num_worst-1]['ade']:.2f} - {all_ade_fde[0]['ade']:.2f} m")
+    
+    # Load, predict, and save worst samples in one pass
+    print(f"Saving worst {actual_num_worst} predictions to {output_dir}/...")
+    worst = []
+    for rank, item in enumerate(tqdm(all_ade_fde[:actual_num_worst], desc="Processing worst")):
+        idx = item['idx']
+        sample = dataset[idx]
+        r = _predict_sample(model, sample, caption_mode)
+        
+        worst.append({
+            'idx': idx,
+            'ade': item['ade'],
+            'fde': item['fde'],
+        })
+        
+        # Save visualization immediately
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Left: Image with trajectory
+        ax1 = axes[0]
+        plot_trajectory_on_image(r['frame'], r['gt_traj'], r['extrinsic'], r['intrinsic'], 
+                                 color='green', label='GT', ax=ax1)
+        plot_trajectory_on_image(r['frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
+                                 color='red', label='Pred', ax=ax1)
+        
+        # Plot physics trajectory if available
+        traj_physics = r.get('trajectory_physics')
+        if traj_physics is not None:
+            plot_trajectory_on_image(r['frame'], traj_physics, r['extrinsic'], r['intrinsic'], 
+                                     color='blue', label='Physics', ax=ax1)
+        
+        ax1.legend(loc='upper right')
+        
+        ego = denormalize_ego_state(r['ego_state'])
+        ax1.set_title(f"Rank {rank+1} | Idx {item['idx']} | ADE: {item['ade']:.2f}m | FDE: {item['fde']:.2f}m\n"
+                      f"Speed: {ego['vEgo']:.1f} m/s | Steer: {ego['steeringAngleDeg']:.0f}°")
+        
+        # Right: Bird's eye view
+        ax2 = axes[1]
+        ax2.plot(r['gt_traj'][:, 0], r['gt_traj'][:, 1], 'g-o', markersize=6, linewidth=2, label='GT')
+        ax2.plot(r['pred_traj'][:, 0], r['pred_traj'][:, 1], 'r-o', markersize=6, linewidth=2, label='Pred')
+        
+        # Plot physics trajectory in bird's eye view
+        if traj_physics is not None:
+            ax2.plot(traj_physics[:, 0], traj_physics[:, 1], 'b-s', markersize=4, 
+                     linewidth=1.5, label='Physics', alpha=0.7)
+        
+        ax2.scatter([0], [0], c='blue', s=150, marker='*', label='Ego', zorder=5)
+        ax2.set_xlabel('Forward (m)')
+        ax2.set_ylabel('Lateral (m)')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        ax2.set_aspect('equal')
+        ax2.set_title("Bird's Eye View")
+        
+        plt.tight_layout()
+        
+        # Add captions (same layout as generate_eval_images)
+        gt_caption = sample.get('caption', 'N/A')[:500]
+        pred_caption = r['pred_caption'][:500]
+        gt_text = f"GT: {gt_caption}..." if len(sample.get('caption', '')) > 500 else f"GT: {gt_caption}"
+        pred_text = f"Pred: {pred_caption}..." if len(r['pred_caption']) > 500 else f"Pred: {pred_caption}"
+        
+        # Adjust layout to make room for captions (bottom) and title (top)
+        plt.subplots_adjust(bottom=0.22, top=0.92)
+        
+        # Place captions in the margin area
+        fig.text(0.02, 0.12, gt_text, fontsize=9, color='green', wrap=True)
+        fig.text(0.02, 0.02, pred_text, fontsize=9, color='red', wrap=True)
+        
+        plt.savefig(f"{output_dir}/{rank:04d}_ade{item['ade']:.2f}_idx{item['idx']}.png", dpi=100)
+        plt.close(fig)
+    
+    print(f"✅ Saved {len(worst)} worst predictions to {output_dir}/")
+    
+    # Return summary
+    return {
+        'worst': worst,  # List of {idx, ade, fde} for worst samples
+        'all_ade_fde': all_ade_fde,  # List of {idx, ade, fde} for all samples
+        'mean_ade': np.mean([r['ade'] for r in all_ade_fde]),
+        'worst_ade': worst[0]['ade'] if worst else 0,
+        'output_dir': output_dir,
+    }
 
