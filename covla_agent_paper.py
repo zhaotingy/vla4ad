@@ -752,7 +752,7 @@ class CoVLAAgentPaper(nn.Module):
         # During training: captions should be GT captions (passed explicitly)
         if captions is None:
             with torch.no_grad():
-                captions = self.generate_caption(images, ego_state)
+                captions = self.generate_caption(images, ego_state, nav_cmd_idx=nav_cmd_idx)
         
         caption_inputs = self.tokenizer(
             captions,
@@ -854,14 +854,16 @@ class CoVLAAgentPaper(nn.Module):
         self,
         images: torch.Tensor,
         ego_state: torch.Tensor,
+        nav_cmd_idx: torch.Tensor,
         max_length: int = 100,
     ) -> List[str]:
         """
-        Generate driving scene captions conditioned on vision + ego state.
+        Generate driving scene captions conditioned on vision + ego state + nav command.
         
         Args:
             images: (B, C, H, W) batch of images
             ego_state: (B, D) where D=1 for speed only, D=3 for extended [vEgo, aEgo, steering]
+            nav_cmd_idx: (B,) navigation command indices (0=LEFT, 1=RIGHT, 2=STRAIGHT)
         """
         self.eval()
         device = images.device
@@ -876,7 +878,11 @@ class CoVLAAgentPaper(nn.Module):
         speed_embeds = self.speed_embedding(ego_state.float().to(device))  # (B, llm_dim)
         speed_embeds = speed_embeds.to(dtype).unsqueeze(1)  # (B, 1, llm_dim)
         
-        # 3. Use SAME prompt as training (must match forward())
+        # 3. Add nav command embedding (always required)
+        nav_embeds = self.nav_cmd_embedding(nav_cmd_idx.to(device))  # (B, llm_dim)
+        nav_embeds = nav_embeds.to(dtype).unsqueeze(1)  # (B, 1, llm_dim)
+        
+        # 4. Use SAME prompt as training (must match forward())
         prompt = "USER: <image> Describe the traffic scene. ASSISTANT: "
         prompt_inputs = self.tokenizer(
             [prompt] * batch_size,
@@ -885,8 +891,8 @@ class CoVLAAgentPaper(nn.Module):
         ).to(device)
         prompt_embeds = self.language_model.get_input_embeddings()(prompt_inputs.input_ids).to(dtype)
         
-        # 4. Combine: [Vision] + [Speed] + [Prompt] (matches training)
-        combined_embeds = torch.cat([vision_embeds, speed_embeds, prompt_embeds], dim=1)
+        # 5. Combine: [Vision] + [Speed] + [Nav] + [Prompt] (matches training forward())
+        combined_embeds = torch.cat([vision_embeds, speed_embeds, nav_embeds, prompt_embeds], dim=1)
         attention_mask = torch.ones(batch_size, combined_embeds.shape[1], device=device)
         
         # 5. Generate using HuggingFace generate() with inputs_embeds
@@ -918,9 +924,9 @@ class CoVLAAgentPaper(nn.Module):
         self, 
         image: torch.Tensor, 
         ego_state: torch.Tensor,
+        nav_cmd_idx,
         caption: str = None,
         caption_mode: str = "pred",
-        nav_cmd_idx: torch.Tensor = None,  # Optional: navigation command index
     ) -> Dict:
         """
         Make prediction for single image.
@@ -932,11 +938,11 @@ class CoVLAAgentPaper(nn.Module):
         Args:
             image: Input image tensor
             ego_state: (D,) ego state - D=1 for speed only, D=3 for extended [vEgo, aEgo, steering]
+            nav_cmd_idx: Navigation command index (0=LEFT, 1=RIGHT, 2=STRAIGHT)
             caption: Ground truth caption (required if caption_mode="gt")
             caption_mode: How to use captions for trajectory prediction
                 - "pred": Generate caption first, use it for trajectory (default)
                 - "gt": Use provided GT caption for trajectory (oracle mode, better ADE)
-            nav_cmd_idx: Navigation command index (0=LEFT, 1=RIGHT, 2=STRAIGHT)
         
         Returns:
             - trajectory: (10, 3) predicted waypoints
@@ -957,13 +963,12 @@ class CoVLAAgentPaper(nn.Module):
             ego_state = ego_state.unsqueeze(0)  # (D,) -> (1, D)
         ego_state = ego_state.to(device)
         
-        # Ensure nav_cmd_idx is batched tensor if provided
-        if nav_cmd_idx is not None:
-            if not isinstance(nav_cmd_idx, torch.Tensor):
-                nav_cmd_idx = torch.tensor([nav_cmd_idx], dtype=torch.long, device=device)
-            elif nav_cmd_idx.dim() == 0:
-                nav_cmd_idx = nav_cmd_idx.unsqueeze(0)
-            nav_cmd_idx = nav_cmd_idx.to(device)
+        # Ensure nav_cmd_idx is batched tensor
+        if not isinstance(nav_cmd_idx, torch.Tensor):
+            nav_cmd_idx = torch.tensor([nav_cmd_idx], dtype=torch.long, device=device)
+        elif nav_cmd_idx.dim() == 0:
+            nav_cmd_idx = nav_cmd_idx.unsqueeze(0)
+        nav_cmd_idx = nav_cmd_idx.to(device)
         
         # Prepare caption based on mode
         if caption_mode == "gt":
@@ -971,8 +976,8 @@ class CoVLAAgentPaper(nn.Module):
                 raise ValueError("caption_mode='gt' requires caption to be provided")
             caption_for_trajectory = caption
         else:
-            # Pred caption mode: generate caption conditioned on image + ego_state
-            generated_captions = self.generate_caption(image, ego_state)
+            # Pred caption mode: generate caption conditioned on image + ego_state + nav_cmd
+            generated_captions = self.generate_caption(image, ego_state, nav_cmd_idx)
             caption_for_trajectory = generated_captions[0]
         
         # Get trajectory using the caption (either GT or predicted)
@@ -1086,9 +1091,7 @@ class CoVLATrainerPaper:
             trajectories = batch['trajectory'].to(self.device)
             captions = batch['caption']  # GT captions for both conditioning and loss
             ego_state = batch['ego_state'].to(self.device)
-            nav_cmd_idx = batch.get('nav_cmd_idx')
-            if nav_cmd_idx is not None:
-                nav_cmd_idx = nav_cmd_idx.to(self.device)
+            nav_cmd_idx = batch['nav_cmd_idx'].to(self.device)
             
             self.optimizer.zero_grad()
             
@@ -1169,12 +1172,17 @@ class CoVLATrainerPaper:
         # Get first sample from batch
         gt_traj = batch['trajectory'][0].cpu().numpy()
         
+        # Get nav command
+        nav_cmd = batch['nav_cmd'][0]
+        nav_cmd_idx = batch['nav_cmd_idx'][0:1].to(self.device)
+        
         # Re-compute prediction in eval mode (training output has dropout noise)
         with torch.no_grad():
             eval_output = self.model(
                 batch['image'][0:1].to(self.device),
                 captions=[batch['caption'][0]],
                 ego_state=batch['ego_state'][0:1].to(self.device),
+                nav_cmd_idx=nav_cmd_idx,
             )
         pred_traj = eval_output['pred_trajectory'][0].cpu().numpy()
         caption = batch['caption'][0] if isinstance(batch['caption'], list) else batch['caption']
@@ -1182,9 +1190,6 @@ class CoVLATrainerPaper:
         # Get ego state and denormalize
         ego_state_raw = batch['ego_state'][0].cpu().numpy()  # (3,) normalized
         ego = denormalize_ego_state(ego_state_raw)
-        
-        # Get nav command
-        nav_cmd = batch.get('nav_cmd', ['STRAIGHT'])[0] if 'nav_cmd' in batch else 'N/A'
         
         # Get matrices - DataLoader collates as [row][col][batch_idx]
         extrinsic = np.array([[col[0].item() for col in row] for row in batch['extrinsic_matrix']])
@@ -1208,7 +1213,11 @@ class CoVLATrainerPaper:
         with torch.no_grad():
             image_tensor = batch['image'][0:1].to(self.device)
             ego_tensor = batch['ego_state'][0:1].to(self.device)
-            pred_caption = self.model.generate_caption(image_tensor, ego_tensor)[0]
+            nav_cmd_idx = batch['nav_cmd_idx'][0:1].to(self.device)
+            pred_caption = self.model.generate_caption(image_tensor, ego_tensor, nav_cmd_idx)[0]
+        
+        # Get physics trajectory (always available like gt_traj)
+        traj_physics = batch['trajectory_physics'][0].cpu().numpy()
         
         # Create figure
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -1217,6 +1226,7 @@ class CoVLATrainerPaper:
         ax1 = axes[0]
         plot_trajectory_on_image(frame, gt_traj, extrinsic, intrinsic, color='green', label='GT', ax=ax1)
         plot_trajectory_on_image(frame, pred_traj, extrinsic, intrinsic, color='red', label='Pred', ax=ax1)
+        plot_trajectory_on_image(frame, traj_physics, extrinsic, intrinsic, color='blue', label='Physics', ax=ax1)
         ax1.legend(loc='upper right')
         # Title with ego state and nav_cmd info
         ax1.set_title(f"Step {step} | Nav: {nav_cmd} | ADE: {ade:.2f}m | FDE: {fde:.2f}m | {ego['vEgo']:.1f} m/s")
@@ -1225,6 +1235,8 @@ class CoVLATrainerPaper:
         ax2 = axes[1]
         ax2.plot(gt_traj[:, 0], gt_traj[:, 1], 'g-o', markersize=5, label='GT')
         ax2.plot(pred_traj[:, 0], pred_traj[:, 1], 'r-o', markersize=5, label='Pred')
+        ax2.plot(traj_physics[:, 0], traj_physics[:, 1], 'b-s', markersize=4, 
+                 label='Physics', alpha=0.7, linewidth=1.5)
         ax2.scatter([0], [0], c='blue', s=100, marker='*', label='Ego', zorder=5)
         ax2.set_xlabel('Forward (m)')
         ax2.set_ylabel('Lateral (m)')
@@ -1258,9 +1270,7 @@ class CoVLATrainerPaper:
             trajectories = batch['trajectory'].to(self.device)
             captions = batch['caption']
             ego_state = batch['ego_state'].to(self.device)
-            nav_cmd_idx = batch.get('nav_cmd_idx')
-            if nav_cmd_idx is not None:
-                nav_cmd_idx = nav_cmd_idx.to(self.device)
+            nav_cmd_idx = batch['nav_cmd_idx'].to(self.device)
             
             output = self.model(images, captions=captions, trajectories=trajectories, 
                               ego_state=ego_state, nav_cmd_idx=nav_cmd_idx)
@@ -1400,7 +1410,7 @@ def load_model(path: str = "covla_trainable.pt", device: str = "cuda") -> CoVLAA
     
     Usage:
         model = load_model("covla_trainable.pt")
-        result = model.predict(image, ego_state=ego_state, caption_mode="pred")
+        result = model.predict(image, ego_state, nav_cmd_idx, caption_mode="pred")
     """
     checkpoint = torch.load(path, map_location=device)
     config = checkpoint.get('config', CoVLAConfig(device=device))
@@ -1662,6 +1672,7 @@ def visualize_inference(
     extrinsic_matrix: np.ndarray,
     intrinsic_matrix: np.ndarray,
     ego_state: torch.Tensor,
+    nav_cmd_idx,
     gt_caption: str = None,
     image_path: str = None,
     caption_mode: str = "pred",
@@ -1673,7 +1684,7 @@ def visualize_inference(
     """
     import matplotlib.pyplot as plt
     
-    result = model.predict(image, ego_state=ego_state, caption=gt_caption, caption_mode=caption_mode)
+    result = model.predict(image, ego_state, nav_cmd_idx, caption=gt_caption, caption_mode=caption_mode)
     pred_traj = result['trajectory']
     pred_caption = result['caption']
     
@@ -1875,8 +1886,8 @@ def _predict_sample(model, sample, caption_mode="pred", debug=False):
     intrinsic = _to_numpy(sample['intrinsic_matrix'])
     ego_state = sample['ego_state']  # (3,) tensor: [vEgo/30, aEgo/5, steering/500]
     gt_caption = sample.get('caption', '')
-    nav_cmd = sample.get('nav_cmd', 'STRAIGHT')
-    nav_cmd_idx = sample.get('nav_cmd_idx', None)  # tensor or None
+    nav_cmd = sample['nav_cmd']
+    nav_cmd_idx = sample['nav_cmd_idx']
     
     # Physics-based trajectory (from IMU simulation)
     traj_physics = sample.get('trajectory_physics')
@@ -1887,10 +1898,10 @@ def _predict_sample(model, sample, caption_mode="pred", debug=False):
     with torch.no_grad():
         result = model.predict(
             sample['image'].unsqueeze(0).to(device),
-            ego_state=ego_state,
+            ego_state,
+            nav_cmd_idx,
             caption=gt_caption if caption_mode == "gt" else None,
             caption_mode=caption_mode,
-            nav_cmd_idx=nav_cmd_idx,  # Pass nav command if available
         )
     pred_traj = result['trajectory']
     pred_caption = result.get('caption', gt_caption)
@@ -1952,7 +1963,7 @@ def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
     
     # Denormalize ego state
     ego = denormalize_ego_state(r['ego_state'])
-    nav_cmd = r.get('nav_cmd', 'N/A')
+    nav_cmd = r['nav_cmd']
     
     # Title with nav_cmd and metrics
     ax1.set_title(f"Nav: {nav_cmd} | ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | {ego['vEgo']:.1f} m/s")
@@ -1980,7 +1991,8 @@ def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
     
     # Print ego state and nav cmd info
     print(f"🧭 Nav: {nav_cmd} | Speed: {ego['vEgo']:.1f} m/s | Accel: {ego['aEgo']:.1f} m/s² | Steer: {ego['steeringAngleDeg']:.0f}°")
-    print(f"📝 Caption: {r['pred_caption'][:500]}...")
+    print(f"📝 GT Caption: {r['gt_caption'][:500]}...")
+    print(f"📝 Pred Caption: {r['pred_caption'][:500]}...")
     if traj_physics is not None:
         print(f"📐 Physics trajectory available (10 points from IMU yaw rate)")
 
@@ -2038,7 +2050,7 @@ def generate_eval_images(
         
         # Denormalize ego state and get nav_cmd
         ego = denormalize_ego_state(r['ego_state'])
-        nav_cmd = r.get('nav_cmd', 'N/A')
+        nav_cmd = r['nav_cmd']
         ax1.set_title(f"Frame {i} | Nav: {nav_cmd} | ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | {ego['vEgo']:.1f} m/s")
         
         # Right: Bird's eye view
@@ -2137,9 +2149,10 @@ def find_worst_predictions(
             trajectories = batch['trajectory'].to(device)
             captions = batch['caption'] if caption_mode == "gt" else None
             ego_state = batch['ego_state'].to(device)
+            nav_cmd_idx = batch['nav_cmd_idx'].to(device)
             
             # Forward pass
-            output = model(images, captions=captions, ego_state=ego_state)
+            output = model(images, captions=captions, ego_state=ego_state, nav_cmd_idx=nav_cmd_idx)
             
             pred_trajs = output['pred_trajectory'].cpu()  # (B, 10, 3)
             gt_trajs = trajectories.cpu()  # (B, 10, 3)
@@ -2194,7 +2207,7 @@ def find_worst_predictions(
         ax1.legend(loc='upper right')
         
         ego = denormalize_ego_state(r['ego_state'])
-        nav_cmd = r.get('nav_cmd', 'N/A')
+        nav_cmd = r['nav_cmd']
         ax1.set_title(f"Rank {rank+1} | Idx {item['idx']} | Nav: {nav_cmd} | ADE: {item['ade']:.2f}m | FDE: {item['fde']:.2f}m\n"
                       f"Speed: {ego['vEgo']:.1f} m/s | Steer: {ego['steeringAngleDeg']:.0f}°")
         
