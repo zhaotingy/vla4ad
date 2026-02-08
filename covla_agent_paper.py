@@ -140,6 +140,9 @@ class CoVLAConfig:
     use_nav_cmd: bool = False  # Add nav command (LEFT/RIGHT/STRAIGHT) as input
     num_nav_cmds: int = 3  # Number of navigation commands
     
+    # Temporal modeling (multi-frame input, always enabled)
+    num_history_frames: int = 2  # Number of history frames (at 2Hz, 2 frames = 1 second of history)
+    
     # Training
     batch_size: int = 8
     learning_rate: float = 2e-5
@@ -207,14 +210,17 @@ class CoVLADatasetPaper(Dataset):
         self.config = config
         self.split = split
         
-        # Sample at 2Hz (every 10th frame from 20Hz data)
-        sample_interval = 20 // config.frame_sample_rate  # = 10
+        # Data is already sampled at 2Hz (0.5s between consecutive frames)
+        # sample_interval is kept for backward compatibility but should be 1 for 2Hz data
+        sample_interval = 1  # Data is already at 2Hz
         
         # Filter and prepare samples with logging
         self.samples = []
         self.physics_mismatch_indices = []  # Store indices for debugging
         filter_counts = {
             'total_candidates': 0,
+            'insufficient_history': 0,
+            'cross_video_boundary': 0,
             'incomplete_trajectory': 0,
             'absolute_too_large': 0,
             'delta_too_large': 0,
@@ -229,6 +235,21 @@ class CoVLADatasetPaper(Dataset):
                 break
             
             filter_counts['total_candidates'] += 1
+            
+            # Check if we have enough history frames (at 2Hz, each index is 0.5s apart)
+            # Need frames at i, i-1, i-2, ... for temporal model
+            history_indices = [i - k for k in range(config.num_history_frames + 1)]
+            if any(idx < 0 or idx >= len(image_files) for idx in history_indices):
+                filter_counts['insufficient_history'] += 1
+                continue
+            
+            # Check all frames are from the same video (same parent directory = same video ID)
+            frame_paths = [image_files[idx] for idx in history_indices]
+            video_dirs = [os.path.dirname(p) for p in frame_paths]
+            if len(set(video_dirs)) > 1:
+                filter_counts['cross_video_boundary'] += 1
+                continue
+            
             state = states_data[i]
             trajectory = state.get('trajectory', [])
             
@@ -338,8 +359,15 @@ class CoVLADatasetPaper(Dataset):
             nav_cmd = get_nav_cmd(caption_text)
             
             filter_counts['passed'] += 1
+            
+            # Collect frame paths (oldest to newest): [t-2, t-1, t]
+            image_paths = [
+                image_files[i - k]
+                for k in range(config.num_history_frames, -1, -1)  # 2, 1, 0
+            ]
+            
             self.samples.append({
-                'image_path': image_files[i],
+                'image_paths': image_paths,  # All frames: [oldest, ..., current]
                 'trajectory': sampled_trajectory,
                 'trajectory_physics': trajectory_physics,  # Simulated from IMU (10 points or None)
                 'caption': caption_text,
@@ -355,6 +383,8 @@ class CoVLADatasetPaper(Dataset):
         filtered = total - passed
         print(f"\n📊 Data filtering summary:")
         print(f"   Total candidates: {total}")
+        print(f"   ├─ Insufficient history: {filter_counts['insufficient_history']}")
+        print(f"   ├─ Cross video boundary: {filter_counts['cross_video_boundary']}")
         print(f"   ├─ Incomplete trajectory: {filter_counts['incomplete_trajectory']}")
         print(f"   ├─ Absolute value >200m: {filter_counts['absolute_too_large']}")
         print(f"   ├─ Delta >20m: {filter_counts['delta_too_large']}")
@@ -363,6 +393,9 @@ class CoVLADatasetPaper(Dataset):
         print(f"   └─ No IMU data (kept): {filter_counts['no_imu_data']}")
         print(f"   ✓ Passed: {passed} ({100*passed/total:.1f}%)")
         print(f"   ✗ Filtered: {filtered} ({100*filtered/total:.1f}%)")
+        num_frames = config.num_history_frames + 1
+        tokens_per_frame = 50 if 'base' in config.vision_encoder else 257
+        print(f"   📹 Temporal: {num_frames} frames/sample ({num_frames} × {tokens_per_frame} = {num_frames * tokens_per_frame} tokens)")
         
         # Split data (80/20 train/val)
         n = len(self.samples)
@@ -399,12 +432,18 @@ class CoVLADatasetPaper(Dataset):
     def __getitem__(self, idx: int) -> Dict:
         sample = self.samples[idx]
         
-        # Load image
-        try:
-            image = Image.open(sample['image_path']).convert('RGB')
-            image = self.transform(image)
-        except Exception:
-            image = torch.zeros(3, self.config.image_size, self.config.image_size)
+        # Load all frames (oldest to newest): [t-2, t-1, t]
+        images = []
+        for img_path in sample['image_paths']:
+            try:
+                img = Image.open(img_path).convert('RGB')
+                img = self.transform(img)
+            except Exception:
+                img = torch.zeros(3, self.config.image_size, self.config.image_size)
+            images.append(img)
+        
+        # Stack: (num_frames, C, H, W) - oldest to newest
+        images = torch.stack(images, dim=0)
         
         # Trajectory: (10, 3)
         trajectory = torch.tensor(sample['trajectory'], dtype=torch.float32)
@@ -431,7 +470,7 @@ class CoVLADatasetPaper(Dataset):
             traj_physics = torch.tensor(traj_physics, dtype=torch.float32)  # (10, 3)
         
         return {
-            'image': image,
+            'images': images,  # (num_frames, C, H, W) - all frames [t-2, t-1, t]
             'trajectory': trajectory,
             'trajectory_physics': traj_physics,  # (10, 3) or None - simulated from IMU
             'caption': sample['caption'],
@@ -440,7 +479,7 @@ class CoVLADatasetPaper(Dataset):
             'nav_cmd_idx': nav_cmd_idx,  # tensor: 0, 1, or 2
             'extrinsic_matrix': sample.get('extrinsic_matrix'),
             'intrinsic_matrix': sample.get('intrinsic_matrix'),
-            'image_path': sample['image_path'],
+            'image_paths': sample['image_paths'],  # All frame paths [t-2, t-1, t] for visualization
         }
 
 
@@ -555,6 +594,10 @@ class CoVLAAgentPaper(nn.Module):
         if config.use_nav_cmd:
             self.nav_cmd_embedding = nn.Embedding(config.num_nav_cmds, self.llm_dim)
         
+        # Temporal modeling (multi-frame input via concatenation)
+        self.num_frames = config.num_history_frames + 1  # e.g., 3 frames for 2 history
+        # Concat fusion: no extra params needed - just concatenate all frame tokens
+        
         # Trajectory MLP (paper specification)
         self.trajectory_mlp = TrajectoryMLP(
             input_dim=self.llm_dim,
@@ -574,6 +617,7 @@ class CoVLAAgentPaper(nn.Module):
         print(f"  Language: {config.language_model}")
         print(f"  Ego state: {'extended (vEgo, aEgo, steering)' if config.use_extended_ego_state else 'speed only'}")
         print(f"  Nav command: {'enabled (LEFT/RIGHT/STRAIGHT)' if config.use_nav_cmd else 'disabled'}")
+        print(f"  Temporal: {self.num_frames} frames (concat)")
         print(f"  Total params: {total:,}")
         print(f"  Trainable: {trainable:,}")
     
@@ -658,6 +702,11 @@ class CoVLAAgentPaper(nn.Module):
         """
         Encode images using vision encoder.
         Returns all patch tokens (not just CLS) for richer visual representation.
+        
+        Args:
+            images: (batch, C, H, W) single frame per sample
+        Returns:
+            patch_tokens: (batch, num_patches+1, vision_dim)
         """
         device = images.device
         
@@ -684,6 +733,36 @@ class CoVLAAgentPaper(nn.Module):
         
         return patch_tokens  # (batch, num_patches+1, vision_dim)
     
+    def encode_temporal_images(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Encode multiple frames and concatenate them.
+        
+        Args:
+            images: (batch, num_frames, C, H, W) multiple frames per sample
+        Returns:
+            fused_features: (batch, num_frames * num_patches, llm_dim) concatenated features
+        """
+        batch_size, num_frames, C, H, W = images.shape
+        
+        # Flatten batch and frames for efficient encoding
+        flat_images = images.view(batch_size * num_frames, C, H, W)
+        
+        # Encode all frames at once
+        patch_tokens = self.encode_image(flat_images)  # (B*T, num_patches, vision_dim)
+        num_patches = patch_tokens.shape[1]
+        
+        # Reshape back: (batch, num_frames, num_patches, vision_dim)
+        patch_tokens = patch_tokens.view(batch_size, num_frames, num_patches, -1)
+        
+        # Project to LLM space
+        vision_embeds = self.vision_projection(patch_tokens)  # (B, T, P, llm_dim)
+        
+        # Concatenate all frame tokens: (batch, num_frames * num_patches, llm_dim)
+        # Order: [frame_t-2, frame_t-1, frame_t] (oldest to newest)
+        fused_features = vision_embeds.view(batch_size, num_frames * num_patches, -1)
+        
+        return fused_features
+    
     def forward(
         self,
         images: torch.Tensor,
@@ -696,7 +775,7 @@ class CoVLAAgentPaper(nn.Module):
         Forward pass for both training and inference.
         
         Args:
-            images: (batch, 3, H, W) input images
+            images: (batch, num_frames, C, H, W) multi-frame input
             captions: Captions for sequence (GT during training, predicted/GT during inference)
             trajectories: Ground truth trajectories (batch, 10, 3) - only for training
             ego_state: (batch, D) where D=1 for speed only, D=3 for extended [vEgo, aEgo, steering]
@@ -711,9 +790,8 @@ class CoVLAAgentPaper(nn.Module):
         device = images.device
         batch_size = images.shape[0]
         
-        # Encode images - get patch tokens (not just CLS)
-        vision_features = self.encode_image(images)  # (batch, num_patches+1, vision_dim)
-        vision_embeds = self.vision_projection(vision_features)  # (batch, num_patches+1, llm_dim)
+        # Encode multi-frame input: (batch, num_frames, C, H, W)
+        vision_embeds = self.encode_temporal_images(images)  # (batch, num_frames * num_patches, llm_dim)
         num_vision_tokens = vision_embeds.shape[1]
         
         # Ego state embedding - 1 token
@@ -752,6 +830,7 @@ class CoVLAAgentPaper(nn.Module):
         # During training: captions should be GT captions (passed explicitly)
         if captions is None:
             with torch.no_grad():
+                # Use all frames for caption generation
                 captions = self.generate_caption(images, ego_state, nav_cmd_idx=nav_cmd_idx)
         
         caption_inputs = self.tokenizer(
@@ -861,7 +940,7 @@ class CoVLAAgentPaper(nn.Module):
         Generate driving scene captions conditioned on vision + ego state + nav command.
         
         Args:
-            images: (B, C, H, W) batch of images
+            images: (B, num_frames, C, H, W) batch of multi-frame images
             ego_state: (B, D) where D=1 for speed only, D=3 for extended [vEgo, aEgo, steering]
             nav_cmd_idx: (B,) navigation command indices (0=LEFT, 1=RIGHT, 2=STRAIGHT)
         """
@@ -870,9 +949,8 @@ class CoVLAAgentPaper(nn.Module):
         batch_size = images.shape[0]
         dtype = next(self.language_model.parameters()).dtype
         
-        # 1. Encode image with CLIP and project to LLM space
-        vision_features = self.encode_image(images)  # (B, num_patches, vision_dim)
-        vision_embeds = self.vision_projection(vision_features).to(dtype)  # (B, num_patches, llm_dim)
+        # 1. Encode all frames with CLIP and project to LLM space
+        vision_embeds = self.encode_temporal_images(images).to(dtype)  # (B, num_frames*num_patches, llm_dim)
         
         # 2. Add ego state embedding
         speed_embeds = self.speed_embedding(ego_state.float().to(device))  # (B, llm_dim)
@@ -922,21 +1000,21 @@ class CoVLAAgentPaper(nn.Module):
     @torch.no_grad()
     def predict(
         self, 
-        image: torch.Tensor, 
+        images: torch.Tensor, 
         ego_state: torch.Tensor,
         nav_cmd_idx,
         caption: str = None,
         caption_mode: str = "pred",
     ) -> Dict:
         """
-        Make prediction for single image.
+        Make prediction for single sample with multi-frame input.
         
         Paper Table 4 shows two inference modes with different ADE results:
         - "Pred. caption" (caption_mode="pred"): ADE 0.955 - generate caption, then predict trajectory
         - "GT caption" (caption_mode="gt"): ADE 0.814 - use GT caption for trajectory (oracle)
         
         Args:
-            image: Input image tensor
+            images: (num_frames, C, H, W) or (1, num_frames, C, H, W) multi-frame input
             ego_state: (D,) ego state - D=1 for speed only, D=3 for extended [vEgo, aEgo, steering]
             nav_cmd_idx: Navigation command index (0=LEFT, 1=RIGHT, 2=STRAIGHT)
             caption: Ground truth caption (required if caption_mode="gt")
@@ -950,11 +1028,12 @@ class CoVLAAgentPaper(nn.Module):
         """
         self.eval()
         
-        if image.dim() == 3:
-            image = image.unsqueeze(0)
+        # Handle input shape: (num_frames, C, H, W) -> (1, num_frames, C, H, W)
+        if images.dim() == 4:
+            images = images.unsqueeze(0)
         
         device = next(self.parameters()).device
-        image = image.to(device)
+        images = images.to(device)
         
         # Ensure ego_state is batched tensor
         if not isinstance(ego_state, torch.Tensor):
@@ -976,12 +1055,12 @@ class CoVLAAgentPaper(nn.Module):
                 raise ValueError("caption_mode='gt' requires caption to be provided")
             caption_for_trajectory = caption
         else:
-            # Pred caption mode: generate caption conditioned on image + ego_state + nav_cmd
-            generated_captions = self.generate_caption(image, ego_state, nav_cmd_idx)
+            # Pred caption mode: generate caption conditioned on all frames + ego_state + nav_cmd
+            generated_captions = self.generate_caption(images, ego_state, nav_cmd_idx)
             caption_for_trajectory = generated_captions[0]
         
         # Get trajectory using the caption (either GT or predicted)
-        output = self.forward(image, captions=[caption_for_trajectory], ego_state=ego_state, nav_cmd_idx=nav_cmd_idx)
+        output = self.forward(images, captions=[caption_for_trajectory], ego_state=ego_state, nav_cmd_idx=nav_cmd_idx)
         trajectory = output['pred_trajectory'][0].cpu().numpy()
         
         return {
@@ -1087,7 +1166,7 @@ class CoVLATrainerPaper:
         global_step = getattr(self, '_global_step', -1)
         
         for batch in dataloader:
-            images = batch['image'].to(self.device)
+            images = batch['images'].to(self.device)  # (B, num_frames, C, H, W)
             trajectories = batch['trajectory'].to(self.device)
             captions = batch['caption']  # GT captions for both conditioning and loss
             ego_state = batch['ego_state'].to(self.device)
@@ -1130,7 +1209,8 @@ class CoVLATrainerPaper:
             global_step += 1
             
             # Visualize every 500 steps (change to smaller number for debugging)
-            if global_step % 500 == 0:
+            # if global_step % 500 == 0:
+            if global_step % 250 == 0:
                 self._visualize_training_sample(batch, output, global_step)
         
         self._global_step = global_step
@@ -1177,9 +1257,11 @@ class CoVLATrainerPaper:
         nav_cmd_idx = batch['nav_cmd_idx'][0:1].to(self.device)
         
         # Re-compute prediction in eval mode (training output has dropout noise)
+        images_input = batch['images'][0:1].to(self.device)  # (1, num_frames, C, H, W)
+        
         with torch.no_grad():
             eval_output = self.model(
-                batch['image'][0:1].to(self.device),
+                images_input,
                 captions=[batch['caption'][0]],
                 ego_state=batch['ego_state'][0:1].to(self.device),
                 nav_cmd_idx=nav_cmd_idx,
@@ -1195,56 +1277,60 @@ class CoVLATrainerPaper:
         extrinsic = np.array([[col[0].item() for col in row] for row in batch['extrinsic_matrix']])
         intrinsic = np.array([[col[0].item() for col in row] for row in batch['intrinsic_matrix']])
         
-        # Load original image from path
-        image_path = batch['image_path'][0] if isinstance(batch['image_path'], list) else batch['image_path']
-        if os.path.exists(image_path):
-            frame = np.array(Image.open(image_path).convert('RGB'))
-        else:
-            image = batch['image'][0]
-            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-            frame = ((image.cpu() * std + mean).clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        # Load frames from paths (original resolution for consistent display)
+        # DataLoader collates lists as: batch['image_paths'][frame_idx][batch_idx]
+        # So first sample's first frame = batch['image_paths'][0][0]
+        # And first sample's last frame = batch['image_paths'][-1][0]
+        first_path = batch['image_paths'][0][0]   # First frame of first sample
+        last_path = batch['image_paths'][-1][0]   # Last frame of first sample
+        first_frame = np.array(Image.open(first_path).convert('RGB'))
+        last_frame = np.array(Image.open(last_path).convert('RGB'))
         
         # Compute metrics
         ade = np.mean(np.linalg.norm(pred_traj - gt_traj, axis=1))
         fde = np.linalg.norm(pred_traj[-1] - gt_traj[-1])
         
-        # Generate predicted caption
+        # Generate predicted caption (uses all frames)
         with torch.no_grad():
-            image_tensor = batch['image'][0:1].to(self.device)
             ego_tensor = batch['ego_state'][0:1].to(self.device)
             nav_cmd_idx = batch['nav_cmd_idx'][0:1].to(self.device)
-            pred_caption = self.model.generate_caption(image_tensor, ego_tensor, nav_cmd_idx)[0]
+            pred_caption = self.model.generate_caption(images_input, ego_tensor, nav_cmd_idx)[0]
         
         # Get physics trajectory (always available like gt_traj)
         traj_physics = batch['trajectory_physics'][0].cpu().numpy()
         
-        # Create figure
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        # Create figure: 3 panels [First Frame | Current Frame | Bird's Eye View]
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         
-        # Left: Image with trajectory
+        # Left: First frame (t-1s)
         ax1 = axes[0]
-        plot_trajectory_on_image(frame, gt_traj, extrinsic, intrinsic, color='green', label='GT', ax=ax1)
-        plot_trajectory_on_image(frame, pred_traj, extrinsic, intrinsic, color='red', label='Pred', ax=ax1)
-        plot_trajectory_on_image(frame, traj_physics, extrinsic, intrinsic, color='blue', label='Physics', ax=ax1)
-        ax1.legend(loc='upper right')
-        # Title with ego state and nav_cmd info
-        ax1.set_title(f"Step {step} | Nav: {nav_cmd} | ADE: {ade:.2f}m | FDE: {fde:.2f}m | {ego['vEgo']:.1f} m/s")
+        ax1.imshow(first_frame)
+        ax1.set_title(f"First Frame (t-1s)")
+        ax1.axis('off')
+        
+        # Middle: Current frame with trajectory
+        ax2 = axes[1]
+        plot_trajectory_on_image(last_frame, gt_traj, extrinsic, intrinsic, color='green', label='GT', ax=ax2)
+        plot_trajectory_on_image(last_frame, pred_traj, extrinsic, intrinsic, color='red', label='Pred', ax=ax2)
+        plot_trajectory_on_image(last_frame, traj_physics, extrinsic, intrinsic, color='blue', label='Physics', ax=ax2)
+        ax2.legend(loc='upper right')
+        ax2.set_title(f"Current Frame | Nav: {nav_cmd} | ADE: {ade:.2f}m | FDE: {fde:.2f}m | {ego['vEgo']:.1f} m/s")
         
         # Right: Bird's eye view
-        ax2 = axes[1]
-        ax2.plot(gt_traj[:, 0], gt_traj[:, 1], 'g-o', markersize=5, label='GT')
-        ax2.plot(pred_traj[:, 0], pred_traj[:, 1], 'r-o', markersize=5, label='Pred')
-        ax2.plot(traj_physics[:, 0], traj_physics[:, 1], 'b-s', markersize=4, 
+        ax3 = axes[2]
+        ax3.plot(gt_traj[:, 0], gt_traj[:, 1], 'g-o', markersize=5, label='GT')
+        ax3.plot(pred_traj[:, 0], pred_traj[:, 1], 'r-o', markersize=5, label='Pred')
+        ax3.plot(traj_physics[:, 0], traj_physics[:, 1], 'b-s', markersize=4, 
                  label='Physics', alpha=0.7, linewidth=1.5)
-        ax2.scatter([0], [0], c='blue', s=100, marker='*', label='Ego', zorder=5)
-        ax2.set_xlabel('Forward (m)')
-        ax2.set_ylabel('Lateral (m)')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        ax2.set_aspect('equal')
-        ax2.set_title("Bird's Eye View")
+        ax3.scatter([0], [0], c='blue', s=100, marker='*', label='Ego', zorder=5)
+        ax3.set_xlabel('Forward (m)')
+        ax3.set_ylabel('Lateral (m)')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        ax3.set_aspect('equal')
+        ax3.set_title("Bird's Eye View")
         
+        plt.suptitle(f"Step {step}", fontsize=12, fontweight='bold')
         plt.tight_layout()
         plt.show()
         plt.close(fig)
@@ -1266,7 +1352,7 @@ class CoVLATrainerPaper:
         n_batches = 0
         
         for batch in dataloader:
-            images = batch['image'].to(self.device)
+            images = batch['images'].to(self.device)  # (B, num_frames, C, H, W)
             trajectories = batch['trajectory'].to(self.device)
             captions = batch['caption']
             ego_state = batch['ego_state'].to(self.device)
@@ -1599,6 +1685,7 @@ def visualize_sample(
 def visualize_dataset_sample(dataset, sample_idx: int):
     """
     Visualize a sample from CoVLADatasetPaper (train_dataset or val_dataset).
+    Shows first frame (t-1s), current frame with trajectory, and bird's eye view.
     
     Usage:
         visualize_dataset_sample(val_dataset, 0)
@@ -1613,17 +1700,10 @@ def visualize_dataset_sample(dataset, sample_idx: int):
     
     sample = dataset[sample_idx]
     
-    # Load original image (not the resized tensor)
-    image_path = sample.get('image_path', None)
-    if image_path and os.path.exists(image_path):
-        frame = np.array(Image.open(image_path))
-    else:
-        # Fallback: convert tensor to numpy (but this is resized)
-        img_tensor = sample['image']
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-        frame = ((img_tensor.cpu() * std + mean).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        print("⚠️ Using resized image (no image_path)")
+    # Load frames:
+    # - First frame: from tensor (224x224, no projection needed)
+    # - Last frame: from path (original resolution for trajectory projection)
+    first_frame, last_frame = _load_frames(sample)
     
     # Get data (handle both tensor and list/array formats)
     trajectory = sample['trajectory'].numpy() if hasattr(sample['trajectory'], 'numpy') else np.array(sample['trajectory'])
@@ -1635,25 +1715,32 @@ def visualize_dataset_sample(dataset, sample_idx: int):
     # Denormalize ego state
     ego = denormalize_ego_state(ego_state_raw)
     
-    # Create figure
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    # Create figure - 3 panels
+    num_frames = len(sample['image_paths'])
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     
-    # Left: Image with trajectory
-    plot_trajectory_on_image(frame, trajectory, extrinsic, intrinsic, 
-                             color='lime', label='GT Trajectory', ax=axes[0])
-    axes[0].set_title(f"Dataset sample {sample_idx} | {ego['vEgo']:.1f} m/s | Accel: {ego['aEgo']:.1f} | Steer: {ego['steeringAngleDeg']:.0f}°")
-    axes[0].legend(loc='upper right')
+    # Left: First frame (history, t-1s)
+    axes[0].imshow(first_frame)
+    axes[0].set_title(f"First Frame (t-{num_frames-1}×0.5s)")
+    axes[0].axis('off')
+    
+    # Middle: Current frame with trajectory
+    plot_trajectory_on_image(last_frame, trajectory, extrinsic, intrinsic, 
+                             color='lime', label='GT Trajectory', ax=axes[1])
+    axes[1].set_title(f"Current Frame | {ego['vEgo']:.1f} m/s | Steer: {ego['steeringAngleDeg']:.0f}°")
+    axes[1].legend(loc='upper right')
     
     # Right: Bird's eye view
-    axes[1].plot(trajectory[:, 0], trajectory[:, 1], 'g-o', markersize=4, label='Trajectory')
-    axes[1].scatter([0], [0], c='red', s=100, marker='*', label='Ego', zorder=5)
-    axes[1].set_xlabel('Forward (m)')
-    axes[1].set_ylabel('Lateral (m)')
-    axes[1].set_title(f"Bird's Eye View ({len(trajectory)} points)")
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-    axes[1].set_aspect('equal')
+    axes[2].plot(trajectory[:, 0], trajectory[:, 1], 'g-o', markersize=4, label='Trajectory')
+    axes[2].scatter([0], [0], c='red', s=100, marker='*', label='Ego', zorder=5)
+    axes[2].set_xlabel('Forward (m)')
+    axes[2].set_ylabel('Lateral (m)')
+    axes[2].set_title(f"Bird's Eye View ({len(trajectory)} points)")
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+    axes[2].set_aspect('equal')
     
+    plt.suptitle(f"Dataset sample {sample_idx}", fontsize=12)
     plt.tight_layout()
     plt.show()
     
@@ -1663,70 +1750,6 @@ def visualize_dataset_sample(dataset, sample_idx: int):
     for i, pt in enumerate(trajectory[:5]):
         print(f"   [{i}]: ({pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f})")
     print(f"📝 Caption:\n{caption[:500]}{'...' if len(caption) > 500 else ''}")
-
-
-def visualize_inference(
-    model,
-    image: torch.Tensor,
-    gt_trajectory: np.ndarray,
-    extrinsic_matrix: np.ndarray,
-    intrinsic_matrix: np.ndarray,
-    ego_state: torch.Tensor,
-    nav_cmd_idx,
-    gt_caption: str = None,
-    image_path: str = None,
-    caption_mode: str = "pred",
-):
-    """
-    Visualize model inference with trajectory overlay on image.
-    
-    For simpler API, use: visualize(model, dataset, idx)
-    """
-    import matplotlib.pyplot as plt
-    
-    result = model.predict(image, ego_state, nav_cmd_idx, caption=gt_caption, caption_mode=caption_mode)
-    pred_traj = result['trajectory']
-    pred_caption = result['caption']
-    
-    # Load frame
-    if image_path and os.path.exists(image_path):
-        frame = np.array(Image.open(image_path).convert('RGB'))
-    else:
-        if image.dim() == 4:
-            image = image[0]
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-        frame = ((image.cpu() * std + mean).clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-    
-    # Metrics
-    ade = compute_ade(torch.tensor(pred_traj).unsqueeze(0), torch.tensor(gt_trajectory).unsqueeze(0))
-    fde = compute_fde(torch.tensor(pred_traj).unsqueeze(0), torch.tensor(gt_trajectory).unsqueeze(0))
-    
-    # Plot
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
-    plot_trajectory_on_image(frame, gt_trajectory, extrinsic_matrix, intrinsic_matrix, 
-                             color='green', label='GT', ax=axes[0])
-    plot_trajectory_on_image(frame, pred_traj, extrinsic_matrix, intrinsic_matrix, 
-                             color='red', label='Pred', ax=axes[0])
-    axes[0].legend()
-    axes[0].set_title(f"ADE: {ade:.2f}m | FDE: {fde:.2f}m")
-    
-    axes[1].plot(gt_trajectory[:, 0], gt_trajectory[:, 1], 'g-o', markersize=5, label='GT')
-    axes[1].plot(pred_traj[:, 0], pred_traj[:, 1], 'r-o', markersize=5, label='Pred')
-    axes[1].scatter([0], [0], c='blue', s=100, marker='*', label='Ego')
-    axes[1].set_xlabel('Forward (m)')
-    axes[1].set_ylabel('Lateral (m)')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-    axes[1].set_aspect('equal')
-    axes[1].set_title("Bird's Eye View")
-    
-    plt.tight_layout()
-    plt.show()
-    
-    print(f"📝 Caption: {pred_caption[:200]}...")
-    return {'pred_trajectory': pred_traj, 'pred_caption': pred_caption, 'ade': ade, 'fde': fde, 'caption': pred_caption}
 
 
 def plot_training_curves(history: Dict):
@@ -1850,23 +1873,18 @@ def _to_numpy(x):
 
 
 def _load_frame(sample, debug=False):
-    """Load high-res frame from sample, fallback to tensor denormalization."""
-    if 'image_path' in sample and os.path.exists(sample['image_path']):
-        frame = np.array(Image.open(sample['image_path']).convert('RGB'))
-        if debug:
-            print(f"  Loaded from path: {sample['image_path']}, shape={frame.shape}, dtype={frame.dtype}")
-        return frame
-    # Denormalize tensor
-    if debug:
-        print(f"  No image_path, using tensor. Keys: {list(sample.keys())}")
-    t = sample['image']
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-    img = (t.cpu() * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
-    frame = (img * 255).astype(np.uint8)
-    if debug:
-        print(f"  Tensor denorm: shape={frame.shape}, min={frame.min()}, max={frame.max()}")
-    return frame
+    """Load high-res frame from sample (current frame) for projection."""
+    path = sample['image_paths'][-1]
+    return np.array(Image.open(path).convert('RGB'))
+
+
+def _load_frames(sample, debug=False):
+    """
+    Load first and last frames from sample (both from paths for consistent resolution).
+    """
+    first_frame = np.array(Image.open(sample['image_paths'][0]).convert('RGB'))
+    last_frame = np.array(Image.open(sample['image_paths'][-1]).convert('RGB'))
+    return first_frame, last_frame
 
 
 def _predict_sample(model, sample, caption_mode="pred", debug=False):
@@ -1874,13 +1892,13 @@ def _predict_sample(model, sample, caption_mode="pred", debug=False):
     Run inference on a dataset sample. Returns dict with all needed data.
     
     Returns:
-        dict with: frame, gt_traj, pred_traj, trajectory_physics, extrinsic, intrinsic, 
+        dict with: first_frame, last_frame, gt_traj, pred_traj, trajectory_physics, extrinsic, intrinsic, 
                    ego_state, gt_caption, pred_caption, ade, fde, nav_cmd
     """
     device = next(model.parameters()).device
     
     # Extract data from sample
-    frame = _load_frame(sample, debug=debug)
+    first_frame, last_frame = _load_frames(sample, debug=debug)
     gt_traj = _to_numpy(sample['trajectory'])
     extrinsic = _to_numpy(sample['extrinsic_matrix'])
     intrinsic = _to_numpy(sample['intrinsic_matrix'])
@@ -1894,10 +1912,11 @@ def _predict_sample(model, sample, caption_mode="pred", debug=False):
     if traj_physics is not None:
         traj_physics = _to_numpy(traj_physics)  # (10, 3)
     
-    # Run inference
+    # Run inference with multi-frame input
     with torch.no_grad():
+        images_input = sample['images'].unsqueeze(0).to(device)  # (1, num_frames, C, H, W)
         result = model.predict(
-            sample['image'].unsqueeze(0).to(device),
+            images_input,
             ego_state,
             nav_cmd_idx,
             caption=gt_caption if caption_mode == "gt" else None,
@@ -1914,7 +1933,8 @@ def _predict_sample(model, sample, caption_mode="pred", debug=False):
     ego_state_np = ego_state.numpy() if hasattr(ego_state, 'numpy') else np.array(ego_state)
     
     return {
-        'frame': frame,
+        'first_frame': first_frame,  # First frame (t-1s)
+        'last_frame': last_frame,    # Current frame
         'gt_traj': gt_traj,
         'pred_traj': pred_traj,
         'trajectory_physics': traj_physics,  # (10, 3) or None - simulated from IMU
@@ -1945,46 +1965,51 @@ def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
     # Get physics trajectory from prediction result
     traj_physics = r.get('trajectory_physics')  # (10, 3) or None
     
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
-    # Left: Image with trajectories
-    ax1 = axes[0]
-    plot_trajectory_on_image(r['frame'], r['gt_traj'], r['extrinsic'], r['intrinsic'], 
-                             color='green', label='GT', ax=ax1)
-    plot_trajectory_on_image(r['frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
-                             color='red', label='Pred', ax=ax1)
-    
-    # Plot physics trajectory on image if available
-    if traj_physics is not None:
-        plot_trajectory_on_image(r['frame'], traj_physics, r['extrinsic'], r['intrinsic'], 
-                                 color='blue', label='Physics', ax=ax1)
-    
-    ax1.legend(loc='upper right')
+    # Create figure: 3 panels [First Frame | Current Frame | Bird's Eye View]
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     
     # Denormalize ego state
     ego = denormalize_ego_state(r['ego_state'])
     nav_cmd = r['nav_cmd']
     
-    # Title with nav_cmd and metrics
-    ax1.set_title(f"Nav: {nav_cmd} | ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | {ego['vEgo']:.1f} m/s")
+    # Left: First frame (t-1s)
+    ax1 = axes[0]
+    ax1.imshow(r['first_frame'])
+    ax1.set_title(f"First Frame (t-1s)")
+    ax1.axis('off')
+    
+    # Middle: Current frame with trajectories
+    ax2 = axes[1]
+    plot_trajectory_on_image(r['last_frame'], r['gt_traj'], r['extrinsic'], r['intrinsic'], 
+                             color='green', label='GT', ax=ax2)
+    plot_trajectory_on_image(r['last_frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
+                             color='red', label='Pred', ax=ax2)
+    
+    # Plot physics trajectory on image if available
+    if traj_physics is not None:
+        plot_trajectory_on_image(r['last_frame'], traj_physics, r['extrinsic'], r['intrinsic'], 
+                                 color='blue', label='Physics', ax=ax2)
+    
+    ax2.legend(loc='upper right')
+    ax2.set_title(f"Current Frame | Nav: {nav_cmd} | ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | {ego['vEgo']:.1f} m/s")
     
     # Right: Bird's eye view
-    ax2 = axes[1]
-    ax2.plot(r['gt_traj'][:, 0], r['gt_traj'][:, 1], 'g-o', markersize=5, label='GT')
-    ax2.plot(r['pred_traj'][:, 0], r['pred_traj'][:, 1], 'r-o', markersize=5, label='Pred')
+    ax3 = axes[2]
+    ax3.plot(r['gt_traj'][:, 0], r['gt_traj'][:, 1], 'g-o', markersize=5, label='GT')
+    ax3.plot(r['pred_traj'][:, 0], r['pred_traj'][:, 1], 'r-o', markersize=5, label='Pred')
     
     # Plot physics trajectory in bird's eye view
     if traj_physics is not None:
-        ax2.plot(traj_physics[:, 0], traj_physics[:, 1], 'b-s', markersize=4, 
+        ax3.plot(traj_physics[:, 0], traj_physics[:, 1], 'b-s', markersize=4, 
                  label='Physics (IMU)', alpha=0.7, linewidth=1.5)
     
-    ax2.scatter([0], [0], c='blue', s=100, marker='*', label='Ego', zorder=5)
-    ax2.set_xlabel('Forward (m)')
-    ax2.set_ylabel('Lateral (m)')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    ax2.set_aspect('equal')
-    ax2.set_title("Bird's Eye View")
+    ax3.scatter([0], [0], c='blue', s=100, marker='*', label='Ego', zorder=5)
+    ax3.set_xlabel('Forward (m)')
+    ax3.set_ylabel('Lateral (m)')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    ax3.set_aspect('equal')
+    ax3.set_title("Bird's Eye View")
     
     plt.tight_layout()
     plt.show()
@@ -2037,33 +2062,39 @@ def generate_eval_images(
         # Get GT caption from sample
         gt_caption = sample.get('caption', 'N/A')
         
-        # Create figure with 2 columns
-        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-        
-        # Left: Image with trajectory overlay
-        ax1 = axes[0]
-        plot_trajectory_on_image(r['frame'], r['gt_traj'], r['extrinsic'], r['intrinsic'], 
-                                 color='green', label='GT', ax=ax1)
-        plot_trajectory_on_image(r['frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
-                                 color='red', label='Pred', ax=ax1)
-        ax1.legend(loc='upper right')
-        
         # Denormalize ego state and get nav_cmd
         ego = denormalize_ego_state(r['ego_state'])
         nav_cmd = r['nav_cmd']
-        ax1.set_title(f"Frame {i} | Nav: {nav_cmd} | ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | {ego['vEgo']:.1f} m/s")
+        
+        # Create figure with 3 columns: [First Frame | Current Frame | Bird's Eye View]
+        fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+        
+        # Left: First frame (t-1s)
+        ax1 = axes[0]
+        ax1.imshow(r['first_frame'])
+        ax1.set_title(f"First Frame (t-1s)")
+        ax1.axis('off')
+        
+        # Middle: Current frame with trajectory overlay
+        ax2 = axes[1]
+        plot_trajectory_on_image(r['last_frame'], r['gt_traj'], r['extrinsic'], r['intrinsic'], 
+                                 color='green', label='GT', ax=ax2)
+        plot_trajectory_on_image(r['last_frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
+                                 color='red', label='Pred', ax=ax2)
+        ax2.legend(loc='upper right')
+        ax2.set_title(f"Frame {i} | Nav: {nav_cmd} | ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | {ego['vEgo']:.1f} m/s")
         
         # Right: Bird's eye view
-        ax2 = axes[1]
-        ax2.plot(r['gt_traj'][:, 0], r['gt_traj'][:, 1], 'g-o', markersize=6, linewidth=2, label='GT')
-        ax2.plot(r['pred_traj'][:, 0], r['pred_traj'][:, 1], 'r-o', markersize=6, linewidth=2, label='Pred')
-        ax2.scatter([0], [0], c='blue', s=150, marker='*', label='Ego', zorder=5)
-        ax2.set_xlabel('Forward (m)')
-        ax2.set_ylabel('Lateral (m)')
-        ax2.legend(loc='upper right')
-        ax2.grid(True, alpha=0.3)
-        ax2.set_aspect('equal')
-        ax2.set_title("Bird's Eye View")
+        ax3 = axes[2]
+        ax3.plot(r['gt_traj'][:, 0], r['gt_traj'][:, 1], 'g-o', markersize=6, linewidth=2, label='GT')
+        ax3.plot(r['pred_traj'][:, 0], r['pred_traj'][:, 1], 'r-o', markersize=6, linewidth=2, label='Pred')
+        ax3.scatter([0], [0], c='blue', s=150, marker='*', label='Ego', zorder=5)
+        ax3.set_xlabel('Forward (m)')
+        ax3.set_ylabel('Lateral (m)')
+        ax3.legend(loc='upper right')
+        ax3.grid(True, alpha=0.3)
+        ax3.set_aspect('equal')
+        ax3.set_title("Bird's Eye View")
         
         plt.tight_layout()
         
@@ -2145,7 +2176,7 @@ def find_worst_predictions(
     sample_idx = 0
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Computing ADE", mininterval=120.0):
-            images = batch['image'].to(device)
+            images = batch['images'].to(device)  # (B, num_frames, C, H, W)
             trajectories = batch['trajectory'].to(device)
             captions = batch['caption'] if caption_mode == "gt" else None
             ego_state = batch['ego_state'].to(device)
@@ -2188,46 +2219,52 @@ def find_worst_predictions(
             'fde': item['fde'],
         })
         
-        # Save visualization immediately
-        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-        
-        # Left: Image with trajectory
-        ax1 = axes[0]
-        plot_trajectory_on_image(r['frame'], r['gt_traj'], r['extrinsic'], r['intrinsic'], 
-                                 color='green', label='GT', ax=ax1)
-        plot_trajectory_on_image(r['frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
-                                 color='red', label='Pred', ax=ax1)
-        
-        # Plot physics trajectory if available
-        traj_physics = r.get('trajectory_physics')
-        if traj_physics is not None:
-            plot_trajectory_on_image(r['frame'], traj_physics, r['extrinsic'], r['intrinsic'], 
-                                     color='blue', label='Physics', ax=ax1)
-        
-        ax1.legend(loc='upper right')
+        # Save visualization: 3 panels [First Frame | Current Frame | Bird's Eye View]
+        fig, axes = plt.subplots(1, 3, figsize=(20, 6))
         
         ego = denormalize_ego_state(r['ego_state'])
         nav_cmd = r['nav_cmd']
-        ax1.set_title(f"Rank {rank+1} | Idx {item['idx']} | Nav: {nav_cmd} | ADE: {item['ade']:.2f}m | FDE: {item['fde']:.2f}m\n"
+        traj_physics = r.get('trajectory_physics')
+        
+        # Left: First frame (t-1s)
+        ax1 = axes[0]
+        ax1.imshow(r['first_frame'])
+        ax1.set_title(f"First Frame (t-1s)")
+        ax1.axis('off')
+        
+        # Middle: Current frame with trajectory
+        ax2 = axes[1]
+        plot_trajectory_on_image(r['last_frame'], r['gt_traj'], r['extrinsic'], r['intrinsic'], 
+                                 color='green', label='GT', ax=ax2)
+        plot_trajectory_on_image(r['last_frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
+                                 color='red', label='Pred', ax=ax2)
+        
+        # Plot physics trajectory if available
+        if traj_physics is not None:
+            plot_trajectory_on_image(r['last_frame'], traj_physics, r['extrinsic'], r['intrinsic'], 
+                                     color='blue', label='Physics', ax=ax2)
+        
+        ax2.legend(loc='upper right')
+        ax2.set_title(f"Rank {rank+1} | Idx {item['idx']} | Nav: {nav_cmd} | ADE: {item['ade']:.2f}m | FDE: {item['fde']:.2f}m\n"
                       f"Speed: {ego['vEgo']:.1f} m/s | Steer: {ego['steeringAngleDeg']:.0f}°")
         
         # Right: Bird's eye view
-        ax2 = axes[1]
-        ax2.plot(r['gt_traj'][:, 0], r['gt_traj'][:, 1], 'g-o', markersize=6, linewidth=2, label='GT')
-        ax2.plot(r['pred_traj'][:, 0], r['pred_traj'][:, 1], 'r-o', markersize=6, linewidth=2, label='Pred')
+        ax3 = axes[2]
+        ax3.plot(r['gt_traj'][:, 0], r['gt_traj'][:, 1], 'g-o', markersize=6, linewidth=2, label='GT')
+        ax3.plot(r['pred_traj'][:, 0], r['pred_traj'][:, 1], 'r-o', markersize=6, linewidth=2, label='Pred')
         
         # Plot physics trajectory in bird's eye view
         if traj_physics is not None:
-            ax2.plot(traj_physics[:, 0], traj_physics[:, 1], 'b-s', markersize=4, 
+            ax3.plot(traj_physics[:, 0], traj_physics[:, 1], 'b-s', markersize=4, 
                      linewidth=1.5, label='Physics', alpha=0.7)
         
-        ax2.scatter([0], [0], c='blue', s=150, marker='*', label='Ego', zorder=5)
-        ax2.set_xlabel('Forward (m)')
-        ax2.set_ylabel('Lateral (m)')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        ax2.set_aspect('equal')
-        ax2.set_title("Bird's Eye View")
+        ax3.scatter([0], [0], c='blue', s=150, marker='*', label='Ego', zorder=5)
+        ax3.set_xlabel('Forward (m)')
+        ax3.set_ylabel('Lateral (m)')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        ax3.set_aspect('equal')
+        ax3.set_title("Bird's Eye View")
         
         plt.tight_layout()
         
