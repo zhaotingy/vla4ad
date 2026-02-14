@@ -158,6 +158,15 @@ class CoVLAConfig:
     val_ratio: float = 0.20
     test_ratio: float = 0.0
     
+    # Data subsampling (to cover more videos with less compute)
+    # sample_stride=1: use all samples (default)
+    # sample_stride=2: use every 2nd sample (2x video coverage, same compute)
+    # sample_stride=3: use every 3rd sample (3x video coverage, same compute)
+    sample_stride: int = 1
+    
+    # Performance optimization
+    gradient_accumulation_steps: int = 1  # Accumulate gradients over N steps (simulate larger batch)
+    
     # Data augmentation (only applied during training)
     augment_trajectory: bool = True  # Add noise to GT trajectory
     augment_ego_state: bool = True   # Add noise to ego state
@@ -396,6 +405,12 @@ class CoVLADatasetPaper(Dataset):
         num_frames = config.num_history_frames + 1
         tokens_per_frame = 50 if 'base' in config.vision_encoder else 257
         print(f"   📹 Temporal: {num_frames} frames/sample ({num_frames} × {tokens_per_frame} = {num_frames * tokens_per_frame} tokens)")
+        
+        # Subsample to cover more videos with less compute
+        if config.sample_stride > 1:
+            original_count = len(self.samples)
+            self.samples = self.samples[::config.sample_stride]
+            print(f"   📉 Subsampled: {original_count} → {len(self.samples)} (stride={config.sample_stride})")
         
         # Split data (80/20 train/val)
         n = len(self.samples)
@@ -1164,15 +1179,14 @@ class CoVLATrainerPaper:
         total_smooth_loss = 0
         n_batches = 0
         global_step = getattr(self, '_global_step', -1)
+        accum_steps = self.config.gradient_accumulation_steps
         
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
             images = batch['images'].to(self.device)  # (B, num_frames, C, H, W)
             trajectories = batch['trajectory'].to(self.device)
             captions = batch['caption']  # GT captions for both conditioning and loss
             ego_state = batch['ego_state'].to(self.device)
             nav_cmd_idx = batch['nav_cmd_idx'].to(self.device)
-            
-            self.optimizer.zero_grad()
             
             # Single forward pass: GT captions condition trajectory AND compute caption loss
             if self.scaler:
@@ -1184,11 +1198,15 @@ class CoVLATrainerPaper:
                         ego_state=ego_state,
                         nav_cmd_idx=nav_cmd_idx,
                     )
-                    loss = output['loss']
+                    loss = output['loss'] / accum_steps  # Scale loss for accumulation
                 
                 self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                
+                # Step optimizer every accum_steps
+                if (batch_idx + 1) % accum_steps == 0:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
             else:
                 output = self.model(
                     images, 
@@ -1197,19 +1215,21 @@ class CoVLATrainerPaper:
                     ego_state=ego_state,
                     nav_cmd_idx=nav_cmd_idx,
                 )
-                loss = output['loss']
+                loss = output['loss'] / accum_steps
                 loss.backward()
-                self.optimizer.step()
+                
+                if (batch_idx + 1) % accum_steps == 0:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
             
-            total_loss += loss.item()
+            total_loss += loss.item() * accum_steps  # Unscale for logging
             total_traj_loss += output.get('trajectory_loss', torch.tensor(0)).item()
             total_caption_loss += output.get('caption_loss', torch.tensor(0)).item()
             total_smooth_loss += output.get('smoothing_loss', torch.tensor(0)).item()
             n_batches += 1
             global_step += 1
             
-            # Visualize every 500 steps (change to smaller number for debugging)
-            # if global_step % 500 == 0:
+            # Visualize every 500 steps
             if global_step % 250 == 0:
                 self._visualize_training_sample(batch, output, global_step)
         
