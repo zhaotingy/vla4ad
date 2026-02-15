@@ -7,20 +7,21 @@
 
 ## Quick Start
 
+**Prerequisites:** Load `states`, `captions_data`, `image_files`, and `lead_car_data` (see Full pipeline below). CoT uses **lead car only** (R2 first, then caption); traffic lights are skipped for now.
+
 ```python
 from covla_agent_paper import *
 
-# Load data (see Colab Tutorial below for data setup)
 config = CoVLAConfig(device="cuda", use_paper_model=True)
-train_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="train")
-val_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="val")
+# lead_car_data required; traffic_light_data optional (not used in R2 currently)
+train_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="train",
+    lead_car_data=lead_car_data, traffic_light_data=None)
+val_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="val",
+    lead_car_data=lead_car_data, traffic_light_data=None)
 
-# Train
 model = CoVLAAgentPaper(config)
 trainer = CoVLATrainerPaper(model, config)
 history = trainer.train(train_dataset, val_dataset, num_epochs=4)
-
-# Evaluate
 generate_eval_images(model, val_dataset, "eval", num_frames=100)
 ```
 
@@ -61,8 +62,8 @@ generate_eval_images(model, val_dataset, "eval", num_frames=100)
 ├── captions/          # Extracted from captions.tar.gz (69MB)
 │   ├── video_id_1.jsonl
 │   └── ...
-├── front_car/         # Extracted from front_car.tar.gz (optional)
-├── traffic_lights/    # Extracted from traffic_lights.tar.gz (optional)
+├── front_car/         # Extracted from front_car.tar.gz (required for CoT R2 — lead car)
+├── traffic_lights/    # Extracted from traffic_lights.tar.gz (optional; not used in R2 yet)
 └── videos/            # Video files (optional, for frame extraction)
     └── ...
 ```
@@ -490,19 +491,61 @@ else:
     print(f"✓ Extracted captions to {captions_dir}/")
 ```
 
-### Cell 5-F: Load States and Captions from Full Dataset
+### Cell 4-G: Download and Extract front_car and traffic_lights (optional, for CoT R2)
 ```python
-# Helper to handle both flat and frame-indexed JSONL formats
-def parse_jsonl_line(line_data):
-    first_key = next(iter(line_data.keys()), None)
-    if first_key and first_key.isdigit() and 'ego_state' not in line_data:
-        return line_data[first_key]
-    return line_data
+# front_car.tar.gz (~132MB) — lead vehicle per frame
+front_car_dir = f"{DATA_DIR}/front_car"
+front_car_marker = f"{front_car_dir}/.extracted"
+if os.path.exists(front_car_marker):
+    print(f"✓ front_car already extracted to {front_car_dir}/")
+else:
+    print("Downloading front_car.tar.gz (~132MB)...")
+    front_car_archive = hf_hub_download(
+        repo_id=REPO_ID,
+        repo_type="dataset",
+        filename="front_car.tar.gz"
+    )
+    print("Extracting front_car...")
+    with tarfile.open(front_car_archive, "r:gz") as tar:
+        tar.extractall(DATA_DIR)
+    with open(front_car_marker, 'w') as f:
+        f.write("extracted")
+    print(f"✓ Extracted front_car to {front_car_dir}/")
 
-# Load states from multiple videos
+# traffic_lights.tar.gz (~65.5MB) — traffic light states per frame
+traffic_lights_dir = f"{DATA_DIR}/traffic_lights"
+traffic_lights_marker = f"{traffic_lights_dir}/.extracted"
+if os.path.exists(traffic_lights_marker):
+    print(f"✓ traffic_lights already extracted to {traffic_lights_dir}/")
+else:
+    print("Downloading traffic_lights.tar.gz (~65.5MB)...")
+    traffic_lights_archive = hf_hub_download(
+        repo_id=REPO_ID,
+        repo_type="dataset",
+        filename="traffic_lights.tar.gz"
+    )
+    print("Extracting traffic_lights...")
+    with tarfile.open(traffic_lights_archive, "r:gz") as tar:
+        tar.extractall(DATA_DIR)
+    with open(traffic_lights_marker, 'w') as f:
+        f.write("extracted")
+    print(f"✓ Extracted traffic_lights to {traffic_lights_dir}/")
+```
+
+### Cell 5-F: Load States, Captions, and Front Car (CoT)
+```python
+# Load states, captions, and front_car (required for CoT R2 — lead car only).
+# traffic_lights can be loaded optionally for a future experiment; not used in R2 yet.
 all_states = []
 all_captions = []
+all_lead_car = []
+all_traffic_lights = []
 video_ids_loaded = []
+
+front_car_dir = f"{DATA_DIR}/front_car"
+traffic_lights_dir = f"{DATA_DIR}/traffic_lights"
+has_front_car = os.path.isdir(front_car_dir)
+has_traffic_lights = os.path.isdir(traffic_lights_dir)
 
 videos_to_load = video_ids[:NUM_VIDEOS]
 
@@ -512,43 +555,113 @@ for i, video_id in enumerate(videos_to_load):
     if not os.path.exists(states_path):
         continue
     
+    video_states = []
     with open(states_path, 'r') as f:
-        video_states = [parse_jsonl_line(json.loads(line)) for line in f if line.strip()]
+        for line in f:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            assert isinstance(row, dict), f"states expected dict, got {type(row)}"
+            first_key = next(iter(row.keys()), None)
+            assert first_key and first_key.isdigit(), f"states expected digit key, got {first_key!r}"
+            video_states.append(row[first_key])
     
     if not video_states:
         continue
     
-    # Load captions
-    video_captions = []
+    # Load captions (JSONL: one line = {"0": {plain_caption, ...}} — dict with digit key)
     captions_path = f"{DATA_DIR}/captions/{video_id}.jsonl"
     if os.path.exists(captions_path):
         with open(captions_path, 'r') as f:
-            video_captions = [parse_jsonl_line(json.loads(line)) for line in f if line.strip()]
+            for line in f:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                assert isinstance(row, dict), f"captions expected dict, got {type(row)}"
+                first_key = next(iter(row.keys()), None)
+                assert first_key and first_key.isdigit(), f"captions expected digit key, got {first_key!r}"
+                all_captions.append(row[first_key])
     
-    # Pad captions to match states
-    if not video_captions:
-        video_captions = [{}]
-    while len(video_captions) < len(video_states):
-        video_captions.append(video_captions[-1])
+    # Pad captions to match this video's state count (align by frame)
+    n_states = len(video_states)
+    while len(all_captions) < len(all_states) + n_states:
+        all_captions.append(all_captions[-1] if all_captions else {})
+    
+    # Load front_car (one line = one frame; GT: {"0": {has_lead, ...}} — dict with digit key)
+    video_lead_car = []
+    if has_front_car:
+        fc_path = f"{front_car_dir}/{video_id}.jsonl"
+        if os.path.exists(fc_path):
+            with open(fc_path, 'r') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    assert isinstance(row, dict), f"front_car expected dict, got {type(row)}"
+                    first_key = next(iter(row.keys()), None)
+                    assert first_key and first_key.isdigit(), f"front_car expected digit key, got {first_key!r}"
+                    video_lead_car.append(row[first_key])
+    while len(video_lead_car) < n_states:
+        video_lead_car.append({})
+    
+    # Load traffic_lights (one line = one frame; GT: {"0": [...] or None} — dict with digit key)
+    video_tlights = []
+    if has_traffic_lights:
+        tl_path = f"{traffic_lights_dir}/{video_id}.jsonl"
+        if os.path.exists(tl_path):
+            with open(tl_path, 'r') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    assert isinstance(row, dict), f"traffic_lights expected dict, got {type(row)}"
+                    first_key = next(iter(row.keys()), None)
+                    assert first_key and first_key.isdigit(), f"traffic_lights expected digit key, got {first_key!r}"
+                    val = row[first_key]
+                    video_tlights.append(val if val is not None else [])
+    while len(video_tlights) < n_states:
+        video_tlights.append([])
     
     all_states.extend(video_states)
-    all_captions.extend(video_captions[:len(video_states)])
+    all_lead_car.extend(video_lead_car[:n_states])
+    all_traffic_lights.extend(video_tlights[:n_states])
     video_ids_loaded.append(video_id)
     
     if (i + 1) % 50 == 0:
         print(f"  Loaded {i + 1}/{len(videos_to_load)} videos ({len(all_states)} frames)")
 
+# Pad captions to match total state count
+while len(all_captions) < len(all_states):
+    all_captions.append(all_captions[-1] if all_captions else {})
+captions_data = all_captions[:len(all_states)]
+
 states = all_states
-captions_data = all_captions
+lead_car_data = all_lead_car
+traffic_light_data = all_traffic_lights
+
 print(f"\n✓ Loaded {len(states)} frames from {len(video_ids_loaded)} videos")
 print(f"✓ Loaded {len(captions_data)} captions")
+if has_front_car:
+    print(f"✓ Loaded {len(lead_car_data)} front_car frames")
+if has_traffic_lights:
+    print(f"✓ Loaded {len(traffic_light_data)} traffic_lights frames")
 
-# Sample at EXTRACT_FPS (must match Cell 7-F)
+# Sample at EXTRACT_FPS (must match frame extraction)
 EXTRACT_FPS = 2
 FRAME_INTERVAL = 20 // EXTRACT_FPS  # 10 for 2Hz
 states = states[::FRAME_INTERVAL]
 captions_data = captions_data[::FRAME_INTERVAL]
+lead_car_data = lead_car_data[::FRAME_INTERVAL]
+traffic_light_data = traffic_light_data[::FRAME_INTERVAL]
 print(f"✓ Sampled at {EXTRACT_FPS}Hz: {len(states)} states, {len(captions_data)} captions")
+if has_front_car or has_traffic_lights:
+    print(f"  CoT: {len(lead_car_data)} lead_car, {len(traffic_light_data)} traffic_lights")
+
+# Create datasets: lead_car_data required; traffic_light_data optional (pass None for lead-car-only CoT)
+train_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="train",
+    lead_car_data=lead_car_data, traffic_light_data=None)
+val_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="val",
+    lead_car_data=lead_car_data, traffic_light_data=None)
 ```
 
 ### Cell 6-F: Download Videos
@@ -851,9 +964,11 @@ config = CoVLAConfig(
 #     batch_size=4,
 # )
 
-# Create datasets
-train_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="train")
-val_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="val")
+# Create datasets: lead_car_data required; traffic_light_data optional (pass None for lead-car-only)
+train_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="train",
+    lead_car_data=lead_car_data, traffic_light_data=None)
+val_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="val",
+    lead_car_data=lead_car_data, traffic_light_data=None)
 
 # Create model
 model = CoVLAAgentPaper(config)

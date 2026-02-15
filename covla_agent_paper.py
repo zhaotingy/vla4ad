@@ -94,6 +94,28 @@ def denormalize_ego_state(ego_state: np.ndarray) -> dict:
 
 
 # =============================================================================
+# CoT R2 (EMMA-style: critical objects with BEV coordinates)
+# =============================================================================
+
+def format_r2_emma(lead_car: dict = None) -> str:
+    """
+    Format R2 (critical objects) in EMMA style. Lead car only; traffic lights skipped (add in next exp).
+    EMMA: "Critical objects are on-road agents that can influence driving, with precise 3D/BEV coordinates."
+    """
+    parts = []
+    if lead_car and lead_car.get('has_lead', False):
+        x = lead_car.get('lead_x')
+        y = lead_car.get('lead_y')
+        if x is not None and y is not None:
+            parts.append(f"vehicle at [{float(x):.1f}, {float(y):.1f}]")
+        else:
+            parts.append("vehicle ahead")
+    if parts:
+        return "Critical objects: " + "; ".join(parts)
+    return "Critical objects: none"
+
+
+# =============================================================================
 # Configuration (matching paper)
 # =============================================================================
 
@@ -206,6 +228,7 @@ class CoVLADatasetPaper(Dataset):
     - Frames sampled at 2Hz
     - 10 trajectory points (uniformly sampled from 60)
     - Excludes frames without complete 3-second trajectory
+    - Optional CoT R2 (EMMA-style): critical objects with BEV coords
     """
     
     def __init__(
@@ -215,9 +238,12 @@ class CoVLADatasetPaper(Dataset):
         image_files: List[str],
         config: CoVLAConfig,
         split: str = "train",  # "train", "val", or "test"
+        lead_car_data: Optional[List[Dict]] = None,   # For CoT R2 (aligned with states_data indices)
+        traffic_light_data: Optional[List[Dict]] = None,
     ):
         self.config = config
         self.split = split
+        assert lead_car_data is not None, "lead_car_data required (CoT: lead car first; traffic_light_data optional for later)"
         
         # Data is already sampled at 2Hz (0.5s between consecutive frames)
         # sample_interval is kept for backward compatibility but should be 1 for 2Hz data
@@ -351,6 +377,13 @@ class CoVLADatasetPaper(Dataset):
             # Get caption
             caption_idx = min(i // sample_interval, len(captions_data) - 1)
             caption = captions_data[caption_idx] if captions_data else {}
+            caption_text = caption.get('rich_caption', caption.get('plain_caption', ''))
+            
+            # CoT R2 (EMMA-style): R2 first, then caption. Lead car only; traffic lights skipped (add in next exp).
+            assert i < len(lead_car_data), f"lead_car_data index {i} >= len {len(lead_car_data)}"
+            lead_car = lead_car_data[i]
+            r2_text = format_r2_emma(lead_car)
+            full_caption = f"{r2_text}\n{caption_text}"
             
             # Get speed (required field - called 'vEgo' in dataset)
             if 'vEgo' not in state:
@@ -364,7 +397,6 @@ class CoVLADatasetPaper(Dataset):
             )
             
             # Extract navigation command from caption
-            caption_text = caption.get('rich_caption', caption.get('plain_caption', ''))
             nav_cmd = get_nav_cmd(caption_text)
             
             filter_counts['passed'] += 1
@@ -379,7 +411,7 @@ class CoVLADatasetPaper(Dataset):
                 'image_paths': image_paths,  # All frames: [oldest, ..., current]
                 'trajectory': sampled_trajectory,
                 'trajectory_physics': trajectory_physics,  # Simulated from IMU (10 points or None)
-                'caption': caption_text,
+                'caption': full_caption,
                 'ego_state': ego_state,  # [vEgo/30, aEgo/5, steering/500] normalized
                 'nav_cmd': nav_cmd,  # 'LEFT', 'RIGHT', or 'STRAIGHT'
                 'extrinsic_matrix': state['extrinsic_matrix'],
@@ -405,6 +437,7 @@ class CoVLADatasetPaper(Dataset):
         num_frames = config.num_history_frames + 1
         tokens_per_frame = 50 if 'base' in config.vision_encoder else 257
         print(f"   📹 Temporal: {num_frames} frames/sample ({num_frames} × {tokens_per_frame} = {num_frames * tokens_per_frame} tokens)")
+        print(f"   📝 CoT R2 (EMMA-style): R2 then caption")
         
         # Subsample to cover more videos with less compute
         if config.sample_stride > 1:
@@ -822,8 +855,8 @@ class CoVLAAgentPaper(nn.Module):
         else:
             nav_embeds = None
         
-        # Prepare text prompt (paper format from Figure 5)
-        prompt = "USER: <image> Describe the traffic scene. ASSISTANT: "
+        # Prepare text prompt (paper format from Figure 5); CoT always on: R2 then caption
+        prompt = "USER: <image> List critical objects (e.g. lead vehicle, traffic lights) and describe the traffic scene. ASSISTANT: "
         prompt_inputs = self.tokenizer(
             [prompt] * batch_size,
             return_tensors="pt",
@@ -975,8 +1008,8 @@ class CoVLAAgentPaper(nn.Module):
         nav_embeds = self.nav_cmd_embedding(nav_cmd_idx.to(device))  # (B, llm_dim)
         nav_embeds = nav_embeds.to(dtype).unsqueeze(1)  # (B, 1, llm_dim)
         
-        # 4. Use SAME prompt as training (must match forward())
-        prompt = "USER: <image> Describe the traffic scene. ASSISTANT: "
+        # 4. Use SAME prompt as training (must match forward()); CoT always on
+        prompt = "USER: <image> List critical objects (e.g. lead vehicle, traffic lights) and describe the traffic scene. ASSISTANT: "
         prompt_inputs = self.tokenizer(
             [prompt] * batch_size,
             return_tensors="pt",
@@ -2074,7 +2107,7 @@ def generate_eval_images(
     metrics = []
     saved_images = []
     
-    for i in tqdm(range(start_idx, end_idx), desc="Processing", mininterval=5.0):
+    for i in tqdm(range(start_idx, end_idx), desc="Processing", mininterval=60.0):
         sample = dataset[i]
         r = _predict_sample(model, sample, caption_mode)
         metrics.append({'ade': r['ade'], 'fde': r['fde']})
