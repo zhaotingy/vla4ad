@@ -603,6 +603,7 @@ for i, video_id in enumerate(videos_to_load):
                     video_lead_car.append(row[first_key])
     while len(video_lead_car) < n_states:
         video_lead_car.append({})
+    video_lead_car = video_lead_car[:n_states]  # trim if CoT file had more lines than state file
     
     # Load traffic_lights (one line = one frame; GT: {"0": [...] or None} — dict with digit key)
     video_tlights = []
@@ -621,6 +622,7 @@ for i, video_id in enumerate(videos_to_load):
                     video_tlights.append(val if val is not None else [])
     while len(video_tlights) < n_states:
         video_tlights.append([])
+    video_tlights = video_tlights[:n_states]  # trim if CoT file had more lines than state file
     
     all_states.extend(video_states)
     all_lead_car.extend(video_lead_car[:n_states])
@@ -639,6 +641,10 @@ states = all_states
 lead_car_data = all_lead_car
 traffic_light_data = all_traffic_lights
 
+# CoT arrays must match state count 1:1 (one entry per frame, same order)
+assert len(lead_car_data) == len(states), f"lead_car_data ({len(lead_car_data)}) must match states ({len(states)})"
+assert len(traffic_light_data) == len(states), f"traffic_light_data ({len(traffic_light_data)}) must match states ({len(states)})"
+
 print(f"\n✓ Loaded {len(states)} frames from {len(video_ids_loaded)} videos")
 print(f"✓ Loaded {len(captions_data)} captions")
 if has_front_car:
@@ -653,11 +659,14 @@ states = states[::FRAME_INTERVAL]
 captions_data = captions_data[::FRAME_INTERVAL]
 lead_car_data = lead_car_data[::FRAME_INTERVAL]
 traffic_light_data = traffic_light_data[::FRAME_INTERVAL]
+assert len(lead_car_data) == len(states), f"After subsample: lead_car_data ({len(lead_car_data)}) must match states ({len(states)})"
+assert len(traffic_light_data) == len(states), f"After subsample: traffic_light_data ({len(traffic_light_data)}) must match states ({len(states)})"
 print(f"✓ Sampled at {EXTRACT_FPS}Hz: {len(states)} states, {len(captions_data)} captions")
 if has_front_car or has_traffic_lights:
     print(f"  CoT: {len(lead_car_data)} lead_car, {len(traffic_light_data)} traffic_lights")
 
-# Create datasets: lead_car_data required; traffic_light_data optional (pass None for lead-car-only CoT)
+# IMPORTANT: Build image_files (in Cell 7-F) so len(image_files) == len(states), same order.
+# Then create datasets: lead_car_data required; traffic_light_data optional (pass None for lead-car-only CoT)
 train_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="train",
     lead_car_data=lead_car_data, traffic_light_data=None)
 val_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="val",
@@ -834,17 +843,20 @@ for i, video_id in enumerate(videos_to_extract):
 
 print(f"\n✓ Frames ready: {extracted_count} extracted, {cached_count} cached")
 
-# Collect image files only from loaded videos
+# Build image_files to match states 1:1 (required: len(image_files) == len(states))
+# States were subsampled at 2Hz in Cell 5-F (FRAME_INTERVAL = 10). Include only those frame indices.
 image_files = []
 for video_id in video_ids_loaded:
     video_frames_dir = f"{frames_dir}/{video_id}"
     if os.path.exists(video_frames_dir):
-        for f in sorted(os.listdir(video_frames_dir)):
-            if f.endswith(('.jpg', '.png', '.jpeg')):
-                image_files.append(os.path.join(video_frames_dir, f))
+        for idx in range(0, 600, FRAME_INTERVAL):  # 0, 10, 20, ... 590 — same as states subsample
+            path = os.path.join(video_frames_dir, f"{idx:04d}.png")
+            if os.path.exists(path):
+                image_files.append(path)
+assert len(image_files) == len(states), f"image_files ({len(image_files)}) must match states ({len(states)})"
 
-print(f"✓ Total frames available: {len(image_files)}")
-print(f"  From {len(video_ids_loaded)} videos with states")
+print(f"✓ Total frames available: {len(image_files)} (must match states for dataset)")
+print(f"  From {len(video_ids_loaded)} videos, 2Hz subsample")
 print(f"  Location: {frames_dir}/")
 ```
 
@@ -1000,6 +1012,21 @@ model = load_model("covla_epoch_5.pt", device="cuda")
 config = CoVLAConfig(device="cuda", use_paper_model=False)
 model = CoVLAAgentPaper(config)
 model.load_trainable("covla_best.pt")
+```
+
+### Cell 6c-alt: Continue training from checkpoint (e.g. 2 more epochs)
+```python
+from covla_agent_paper import CoVLAAgentPaper, CoVLATrainerPaper
+
+# Set LR first so we continue from end of epoch 3 (don't restart at 2e-5)
+config.learning_rate = 6.7e-6  # was eta_min after 3 epochs
+model = CoVLAAgentPaper(config)
+model.load_trainable("covla_best.pt")  # load weights only; config already set above
+model.train()
+trainer = CoVLATrainerPaper(model, config)
+history = trainer.train(train_dataset, val_dataset, num_epochs=2)
+
+# New checkpoints: covla_epoch_4.pt, covla_epoch_5.pt; covla_best.pt updated if ADE improves
 ```
 
 ### Model Comparison

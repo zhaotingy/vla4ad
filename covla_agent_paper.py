@@ -115,6 +115,29 @@ def format_r2_emma(lead_car: dict = None) -> str:
     return "Critical objects: none"
 
 
+def parse_r2_from_caption(caption: str) -> Tuple[bool, Optional[float], Optional[float]]:
+    """
+    Parse R2 (lead vehicle) from a caption string.
+    Returns (has_lead, x, y). x,y are None if no lead or not parseable.
+    """
+    import re
+    if not caption:
+        return False, None, None
+    # "Critical objects: none" or "... vehicle at [x, y] ..."
+    if "Critical objects: none" in caption:
+        return False, None, None
+    match = re.search(r"vehicle at\s*\[\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\]", caption)
+    if match:
+        try:
+            x, y = float(match.group(1)), float(match.group(2))
+            return True, x, y
+        except ValueError:
+            return True, None, None
+    if "vehicle at" in caption or "vehicle ahead" in caption:
+        return True, None, None  # lead present but no coords
+    return False, None, None
+
+
 # =============================================================================
 # Configuration (matching paper)
 # =============================================================================
@@ -1395,14 +1418,23 @@ class CoVLATrainerPaper:
         self.model.train()
     
     @torch.no_grad()
-    def evaluate(self, dataloader: DataLoader) -> Dict[str, float]:
-        """Evaluate on validation/test set."""
+    def evaluate(self, dataloader) -> Dict[str, float]:
+        """Evaluate on validation/test set. Accepts Dataset or DataLoader. Includes R2 (lead vehicle) metrics."""
+        if isinstance(dataloader, Dataset):
+            dataloader = DataLoader(dataloader, batch_size=self.config.batch_size, shuffle=False)
         self.model.eval()
         
         total_loss = 0
         all_pred = []
         all_gt = []
         n_batches = 0
+        # R2 (lead vehicle) metrics: precision & recall for "lead" class
+        n_gt_lead = 0
+        n_gt_none = 0
+        n_pred_lead = 0
+        n_correct_lead = 0
+        n_correct_none = 0
+        r2_dist_errors = []
         
         for batch in dataloader:
             images = batch['images'].to(self.device)  # (B, num_frames, C, H, W)
@@ -1411,25 +1443,59 @@ class CoVLATrainerPaper:
             ego_state = batch['ego_state'].to(self.device)
             nav_cmd_idx = batch['nav_cmd_idx'].to(self.device)
             
-            output = self.model(images, captions=captions, trajectories=trajectories, 
+            output = self.model(images, captions=captions, trajectories=trajectories,
                               ego_state=ego_state, nav_cmd_idx=nav_cmd_idx)
             
             total_loss += output['loss'].item()
             all_pred.append(output['pred_trajectory'].cpu())
             all_gt.append(trajectories.cpu())
             n_batches += 1
+            
+            # R2: generate captions and parse lead vehicle (GT vs pred)
+            pred_captions = self.model.generate_caption(images, ego_state, nav_cmd_idx)
+            for gt_cap, pred_cap in zip(captions, pred_captions):
+                has_lead_gt, x_gt, y_gt = parse_r2_from_caption(gt_cap)
+                has_lead_pred, x_pred, y_pred = parse_r2_from_caption(pred_cap)
+                if has_lead_pred:
+                    n_pred_lead += 1
+                if has_lead_gt:
+                    n_gt_lead += 1
+                    if has_lead_pred:
+                        n_correct_lead += 1
+                        if x_gt is not None and y_gt is not None and x_pred is not None and y_pred is not None:
+                            dist = np.sqrt((x_pred - x_gt) ** 2 + (y_pred - y_gt) ** 2)
+                            r2_dist_errors.append(float(dist))
+                else:
+                    n_gt_none += 1
+                    if not has_lead_pred:
+                        n_correct_none += 1
         
-        # Compute metrics
+        # Trajectory metrics
         all_pred = torch.cat(all_pred, dim=0)
         all_gt = torch.cat(all_gt, dim=0)
-        
         ade = compute_ade(all_pred, all_gt)
         fde = compute_fde(all_pred, all_gt)
+        
+        # R2 metrics: precision = when we predicted lead, % correct; recall = when GT lead, % we predicted lead
+        total_r2 = n_gt_lead + n_gt_none
+        n_correct_presence = n_correct_lead + n_correct_none
+        r2_acc = (n_correct_presence / total_r2) if total_r2 else 0.0
+        r2_recall = (n_correct_lead / n_gt_lead) if n_gt_lead else 0.0   # TP / (TP+FN)
+        r2_precision = (n_correct_lead / n_pred_lead) if n_pred_lead else 0.0  # TP / (TP+FP)
+        r2_ratio_lead = (n_gt_lead / total_r2) if total_r2 else 0.0      # fraction of val samples with lead
+        r2_dist_mean = float(np.mean(r2_dist_errors)) if r2_dist_errors else float('nan')
         
         return {
             'loss': total_loss / n_batches,
             'ade': ade,
             'fde': fde,
+            'r2_acc': r2_acc,
+            'r2_recall': r2_recall,
+            'r2_precision': r2_precision,
+            'r2_ratio_lead': r2_ratio_lead,
+            'r2_dist_mean': r2_dist_mean,
+            'r2_n_lead': n_gt_lead,
+            'r2_n_correct_lead': n_correct_lead,
         }
     
     def train(
@@ -1501,6 +1567,10 @@ class CoVLATrainerPaper:
                 self.history['val_loss'].append(val_metrics['loss'])
                 self.history['val_ade'].append(val_metrics['ade'])
                 self.history['val_fde'].append(val_metrics['fde'])
+                self.history.setdefault('r2_acc', []).append(val_metrics['r2_acc'])
+                self.history.setdefault('r2_recall', []).append(val_metrics['r2_recall'])
+                self.history.setdefault('r2_precision', []).append(val_metrics['r2_precision'])
+                self.history.setdefault('r2_dist_mean', []).append(val_metrics['r2_dist_mean'])
                 
                 summary = (f"{epoch+1:<6}{train_metrics['loss']:<10.4f}"
                           f"{train_metrics['trajectory_loss']:<10.4f}"
@@ -1510,6 +1580,12 @@ class CoVLATrainerPaper:
                           f"{val_metrics['ade']:<8.3f}{val_metrics['fde']:<8.3f}")
                 print(summary)
                 self._epoch_summaries.append(summary)
+                # R2 (lead vehicle): precision & recall for "lead" class, dist_err when both have coords
+                r2_dist = val_metrics['r2_dist_mean']
+                r2_dist_s = f"{r2_dist:.2f}" if not np.isnan(r2_dist) else "n/a"
+                print(f"      R2: acc={val_metrics['r2_acc']:.3f} prec={val_metrics['r2_precision']:.3f} rec={val_metrics['r2_recall']:.3f} "
+                      f"lead_ratio={val_metrics['r2_ratio_lead']:.2f} dist_err(m)={r2_dist_s} "
+                      f"({val_metrics['r2_n_correct_lead']}/{val_metrics['r2_n_lead']} lead detected)")
                 
                 # Save best model
                 if val_metrics['ade'] < best_ade:
@@ -1550,6 +1626,11 @@ def load_model(path: str = "covla_trainable.pt", device: str = "cuda") -> CoVLAA
     Usage:
         model = load_model("covla_trainable.pt")
         result = model.predict(image, ego_state, nav_cmd_idx, caption_mode="pred")
+    
+    Continue training (use load_trainable so your config.learning_rate is used):
+        config.learning_rate = 6.7e-6
+        model = CoVLAAgentPaper(config); model.load_trainable("covla_best.pt")
+        trainer = CoVLATrainerPaper(model, config); trainer.train(..., num_epochs=2)
     """
     checkpoint = torch.load(path, map_location=device)
     config = checkpoint.get('config', CoVLAConfig(device=device))
