@@ -212,6 +212,9 @@ class CoVLAConfig:
     # Performance optimization
     gradient_accumulation_steps: int = 1  # Accumulate gradients over N steps (simulate larger batch)
     
+    # Extra R2 loss: CE on tokens before the first \n in caption (= R2 prefix)
+    caption_r2_weight: float = 1.0
+    
     # Data augmentation (only applied during training)
     augment_trajectory: bool = True  # Add noise to GT trajectory
     augment_ego_state: bool = True   # Add noise to ego state
@@ -975,27 +978,47 @@ class CoVLAAgentPaper(nn.Module):
             smoothing_loss = torch.mean(pred_accel ** 2)
             result['smoothing_loss'] = smoothing_loss
             
-            # Task 1: Caption Generation (Cross-Entropy loss)
-            # Use outputs from same forward pass (captions are GT during training)
+            # Task 1: Caption Generation — original full caption CE loss
             logits = outputs.logits
             caption_len = caption_inputs.input_ids.shape[1]
-            
-            # Extract logits for caption positions (shifted by 1 for autoregressive prediction)
-            caption_logits = logits[:, prefix_len-1:prefix_len+caption_len-1, :]
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            targets = caption_inputs.input_ids
+            caption_logits = logits[:, prefix_len-1:prefix_len+caption_len-1, :]  # (B, L, V)
             
             caption_loss = F.cross_entropy(
                 caption_logits.reshape(-1, caption_logits.size(-1)),
-                caption_inputs.input_ids.reshape(-1),
-                ignore_index=self.tokenizer.pad_token_id,
+                targets.reshape(-1),
+                ignore_index=pad_id,
             )
             result['caption_loss'] = caption_loss
             
-            # Combined loss (paper: equally weighted + smoothing)
-            result['loss'] = (
-                self.config.caption_weight * caption_loss +
-                self.config.trajectory_weight * trajectory_loss +
-                self.smoothing_weight * smoothing_loss
-            )
+            # Extra R2 loss: CE on tokens before first \n (= R2 prefix boundary)
+            # Caption is "Critical objects: ...\nScene description..."
+            # Use [-1] because SentencePiece tokenizers prepend a space token when encoding "\n" standalone
+            loss = self.config.caption_weight * caption_loss + self.config.trajectory_weight * trajectory_loss + self.smoothing_weight * smoothing_loss
+            newline_id = self.tokenizer.encode("\n", add_special_tokens=False)[-1]
+            n_r2 = (targets == newline_id).float().argmax(dim=1)  # (B,) first \n position per sample
+            # Verify R2 decode on first call
+            if not hasattr(self, '_r2_verified'):
+                self._r2_verified = True
+                B = targets.shape[0]
+                print(f"\n  ── R2 loss verification (first batch, {B} samples) ──")
+                print(f"  newline_id={newline_id}  encode('\\n')={self.tokenizer.encode(chr(10), add_special_tokens=False)}")
+                print(f"  caption_len={caption_len}  pad_id={pad_id}")
+                for b in range(min(B, 3)):
+                    r2_decoded = self.tokenizer.decode(targets[b, :n_r2[b]])
+                    rest_decoded = self.tokenizer.decode(targets[b, n_r2[b]:n_r2[b]+10])
+                    print(f"  sample {b}: n_r2={n_r2[b].item():3d} | R2='{r2_decoded}'")
+                    print(f"             rest='{rest_decoded}...'")
+                print(f"  ──────────────────────────────────────────────\n")
+            t_ar = torch.arange(caption_len, device=targets.device)
+            r2_mask = (t_ar.unsqueeze(0) < n_r2.unsqueeze(1)) & (targets != pad_id)
+            assert r2_mask.any(), "No R2 tokens found — no newline in tokenized caption"
+            ce_none = F.cross_entropy(caption_logits.reshape(-1, caption_logits.size(-1)), targets.reshape(-1), ignore_index=pad_id, reduction="none").view(targets.shape)
+            r2_loss = ce_none[r2_mask].mean()
+            loss = loss + self.config.caption_r2_weight * r2_loss
+            result['r2_loss'] = r2_loss
+            result['loss'] = loss
         
         return result
     
@@ -1232,6 +1255,7 @@ class CoVLATrainerPaper:
         total_loss = 0
         total_traj_loss = 0
         total_caption_loss = 0
+        total_r2_loss = 0
         total_smooth_loss = 0
         n_batches = 0
         global_step = getattr(self, '_global_step', -1)
@@ -1244,12 +1268,11 @@ class CoVLATrainerPaper:
             ego_state = batch['ego_state'].to(self.device)
             nav_cmd_idx = batch['nav_cmd_idx'].to(self.device)
             
-            # Single forward pass: GT captions condition trajectory AND compute caption loss
             if self.scaler:
                 with torch.cuda.amp.autocast():
                     output = self.model(
-                        images, 
-                        captions=captions,          # GT captions for trajectory conditioning
+                        images,
+                        captions=captions,
                         trajectories=trajectories,
                         ego_state=ego_state,
                         nav_cmd_idx=nav_cmd_idx,
@@ -1265,7 +1288,7 @@ class CoVLATrainerPaper:
                     self.optimizer.zero_grad()
             else:
                 output = self.model(
-                    images, 
+                    images,
                     captions=captions,
                     trajectories=trajectories,
                     ego_state=ego_state,
@@ -1281,6 +1304,7 @@ class CoVLATrainerPaper:
             total_loss += loss.item() * accum_steps  # Unscale for logging
             total_traj_loss += output.get('trajectory_loss', torch.tensor(0)).item()
             total_caption_loss += output.get('caption_loss', torch.tensor(0)).item()
+            total_r2_loss += output['r2_loss'].item()
             total_smooth_loss += output.get('smoothing_loss', torch.tensor(0)).item()
             n_batches += 1
             global_step += 1
@@ -1295,6 +1319,7 @@ class CoVLATrainerPaper:
             'loss': total_loss / n_batches,
             'trajectory_loss': total_traj_loss / n_batches,
             'caption_loss': total_caption_loss / n_batches,
+            'r2_loss': total_r2_loss / n_batches,
             'smoothing_loss': total_smooth_loss / n_batches,
         }
     
@@ -1548,7 +1573,7 @@ class CoVLATrainerPaper:
         for line in self._training_info:
             print(line)
         
-        header = f"{'Epoch':<6}{'Loss':<10}{'Traj':<10}{'Cap':<10}{'Smooth':<10}{'Val':<10}{'ADE':<8}{'FDE':<8}"
+        header = f"{'Epoch':<6}{'Loss':<10}{'Traj':<10}{'Cap':<10}{'R2':<10}{'Smooth':<10}{'Val':<10}{'ADE':<8}{'FDE':<8}"
         self._header = header
         print(header)
         print("-" * len(header))
@@ -1575,6 +1600,7 @@ class CoVLATrainerPaper:
                 summary = (f"{epoch+1:<6}{train_metrics['loss']:<10.4f}"
                           f"{train_metrics['trajectory_loss']:<10.4f}"
                           f"{train_metrics['caption_loss']:<10.4f}"
+                          f"{train_metrics['r2_loss']:<10.4f}"
                           f"{train_metrics['smoothing_loss']:<10.4f}"
                           f"{val_metrics['loss']:<10.4f}"
                           f"{val_metrics['ade']:<8.3f}{val_metrics['fde']:<8.3f}")
@@ -1595,6 +1621,7 @@ class CoVLATrainerPaper:
                 summary = (f"{epoch+1:<6}{train_metrics['loss']:<10.4f}"
                           f"{train_metrics['trajectory_loss']:<10.4f}"
                           f"{train_metrics['caption_loss']:<10.4f}"
+                          f"{train_metrics['r2_loss']:<10.4f}"
                           f"{train_metrics['smoothing_loss']:<10.4f}")
                 print(summary)
                 self._epoch_summaries.append(summary)
