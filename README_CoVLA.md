@@ -12,7 +12,7 @@
 ```python
 from covla_agent_paper import *
 
-config = CoVLAConfig(device="cuda", use_paper_model=True)
+config = CoVLAConfig(device="cuda", use_paper_model=True, quantize="8bit")
 # lead_car_data required; traffic_light_data optional (not used in R2 currently)
 train_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="train",
     lead_car_data=lead_car_data, traffic_light_data=None)
@@ -90,12 +90,13 @@ Ego State → Linear Embedding ────────────────�
 - **Ego State**: Linear embedding of [speed, acceleration, steering angle]
 
 ### Training (Section 4)
-- **Loss**: `0.5 × Caption_CE + 0.5 × Trajectory_MSE`
+- **Loss**: `0.5 × Caption_CE + 0.5 × Trajectory_MSE + R2_weight × R2_CE` (R2 = extra CE on lead-car tokens)
 - **Trajectory**: 10 points uniformly sampled from 60 (3-second horizon)
 - **Frame sampling**: 2Hz
 - **Split**: 80% train / 20% val (configurable)
 - **Learning rate**: 2e-5 with cosine decay to 1/3 of original
 - **Data augmentation**: Image color jitter, trajectory noise, ego state noise
+- **Quantization**: 8-bit or 4-bit QLoRA to reduce VRAM and increase batch size
 
 ### Results
 | Setting | ADE | FDE | Notes |
@@ -115,9 +116,14 @@ config = CoVLAConfig(
     # Model selection
     use_paper_model=True,        # True: CLIP ViT-L + Mistral 7B, False: lightweight
     
+    # Quantization (QLoRA) — reduces LLM VRAM, enables larger batch size
+    quantize="8bit",             # "none" (FP16), "8bit", or "4bit"
+    # Mistral 7B: FP16 ~14GB → 8bit ~7GB → 4bit ~3.5GB
+    # Estimated batch size on 24GB GPU: FP16 ~4-5 → 8bit ~10-12 → 4bit ~16-20
+    
     # Training
     learning_rate=2e-5,          # Initial LR (cosine decay to 1/3)
-    batch_size=8,                # Reduce if OOM
+    batch_size=8,                # Increase with quantize="8bit" or "4bit"
     num_epochs=10,
     
     # Data split
@@ -136,6 +142,7 @@ config = CoVLAConfig(
     caption_weight=0.5,
     trajectory_weight=0.5,
     smoothing_weight=0.1,        # Penalize trajectory acceleration
+    caption_r2_weight=1.0,       # Extra R2 loss weight (CE on lead-car tokens)
     
     # Ego state
     use_extended_ego_state=True, # Use [vEgo, aEgo, steering] instead of just speed
@@ -155,6 +162,26 @@ config = CoVLAConfig(
 | **Ego state** | Multiplicative (2%) | On | Sensor noise robustness |
 
 Augmentation only applies to training set; validation stays clean.
+
+### Quantization (QLoRA)
+
+Quantize the base LLM to reduce VRAM and increase batch size. LoRA adapters remain in FP16.
+
+| Mistral 7B | FP16 (`"none"`) | 8-bit (`"8bit"`) | 4-bit (`"4bit"`) |
+|------------|-----------------|-------------------|-------------------|
+| LLM memory | ~14GB | ~7GB | ~3.5GB |
+| Batch size (24GB GPU) | 4-5 | 10-12 | 16-20 |
+| Accuracy impact | baseline | minimal | slight degradation |
+
+```python
+# 8-bit (recommended — best accuracy/memory tradeoff)
+config = CoVLAConfig(use_paper_model=True, quantize="8bit", batch_size=10)
+
+# 4-bit (maximum memory savings)
+config = CoVLAConfig(use_paper_model=True, quantize="4bit", batch_size=16)
+```
+
+Existing checkpoints are compatible — they only contain LoRA + heads, not the base model weights. Requires `bitsandbytes` (`pip install bitsandbytes`).
 
 ---
 
@@ -951,13 +978,14 @@ Since the full dataset requires video frame extraction, you can also:
 from covla_agent_paper import *
 
 # ============================================================
-# Option A: Paper Model (RECOMMENDED for better captions)
-# Requires: ~24GB VRAM (A100) or ~16GB with 8-bit quantization
+# Option A: Paper Model with 8-bit QLoRA (RECOMMENDED)
+# Mistral 7B quantized to 8-bit: ~7GB LLM → batch_size 10-12 on 24GB GPU
 # ============================================================
 config = CoVLAConfig(
     device="cuda",
     use_paper_model=True,      # CLIP ViT-L + Mistral 7B
-    batch_size=4,              # Reduce if OOM (default: 8)
+    quantize="8bit",           # 8-bit QLoRA — halves LLM memory, doubles batch size
+    batch_size=10,             # 8-bit allows larger batches (was 4-5 with FP16)
     learning_rate=2e-5,        # Cosine decay to 1/3 of this
     
     # Data augmentation (helps prevent overfitting)
@@ -967,13 +995,24 @@ config = CoVLAConfig(
 )
 
 # ============================================================
-# Option B: Lightweight Model (for free Colab T4 GPU)
+# Option B: Paper Model without quantization (FP16)
+# Requires ~24GB VRAM, batch_size limited to 4-5
+# ============================================================
+# config = CoVLAConfig(
+#     device="cuda",
+#     use_paper_model=True,
+#     quantize="none",         # Full FP16
+#     batch_size=4,
+# )
+
+# ============================================================
+# Option C: Lightweight Model (for free Colab T4 GPU)
 # Works with ~8GB VRAM but caption quality is lower
 # ============================================================
 # config = CoVLAConfig(
 #     device="cuda",
 #     use_paper_model=False,  # CLIP ViT-B + TinyLlama 1.1B
-#     batch_size=4,
+#     batch_size=8,
 # )
 
 # Create datasets: lead_car_data required; traffic_light_data optional (pass None for lead-car-only)

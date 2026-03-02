@@ -190,6 +190,7 @@ class CoVLAConfig:
     
     # Training
     batch_size: int = 8
+    eval_batch_size: int = 16  # Eval has no gradients, can use larger batch
     learning_rate: float = 2e-5
     num_epochs: int = 10
     
@@ -211,6 +212,7 @@ class CoVLAConfig:
     
     # Performance optimization
     gradient_accumulation_steps: int = 1  # Accumulate gradients over N steps (simulate larger batch)
+    quantize: str = "none"  # "none", "8bit", or "4bit" — reduces LLM memory, enables larger batch size
     
     # Extra R2 loss: CE on tokens before the first \n in caption (= R2 prefix)
     caption_r2_weight: float = 1.0
@@ -634,10 +636,27 @@ class CoVLAAgentPaper(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(config.language_model)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         
+        load_kwargs = {"torch_dtype": torch.float16 if config.device == "cuda" else torch.float32}
+        if config.quantize == "8bit":
+            load_kwargs["load_in_8bit"] = True
+            print("  Loading LLM in 8-bit (QLoRA) — ~50% less VRAM")
+        elif config.quantize == "4bit":
+            from transformers import BitsAndBytesConfig
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+            )
+            print("  Loading LLM in 4-bit (QLoRA NF4) — ~75% less VRAM")
         self.language_model = AutoModelForCausalLM.from_pretrained(
             config.language_model,
-            torch_dtype=torch.float16 if config.device == "cuda" else torch.float32,
+            **load_kwargs,
         )
+        
+        # Prepare quantized model for training (freeze base, enable gradient on adapters)
+        if config.quantize != "none":
+            from peft import prepare_model_for_kbit_training
+            self.language_model = prepare_model_for_kbit_training(self.language_model)
         
         # Apply LoRA for efficient fine-tuning
         if config.use_lora:
@@ -888,17 +907,17 @@ class CoVLAAgentPaper(nn.Module):
             return_tensors="pt",
             padding=True,
         ).to(device)
-        prompt_embeds = self.language_model.get_input_embeddings()(prompt_inputs.input_ids)
+        prompt_embeds = self.language_model.get_input_embeddings()(prompt_inputs.input_ids).to(device)
         
         # Trajectory query tokens (paper: 10 learnable queries appended at end)
         traj_queries = self.trajectory_queries.expand(batch_size, -1, -1)  # (batch, 10, llm_dim)
         
-        # Match dtypes
-        vision_embeds = vision_embeds.to(prompt_embeds.dtype)
-        traj_queries = traj_queries.to(prompt_embeds.dtype)
-        speed_embeds = speed_embeds.to(prompt_embeds.dtype)
+        # Match dtypes and device (8-bit quantization can leave embeddings on CPU)
+        vision_embeds = vision_embeds.to(device=device, dtype=prompt_embeds.dtype)
+        traj_queries = traj_queries.to(device=device, dtype=prompt_embeds.dtype)
+        speed_embeds = speed_embeds.to(device=device, dtype=prompt_embeds.dtype)
         if nav_embeds is not None:
-            nav_embeds = nav_embeds.to(prompt_embeds.dtype)
+            nav_embeds = nav_embeds.to(device=device, dtype=prompt_embeds.dtype)
         
         # During inference: generate captions if not provided
         # During training: captions should be GT captions (passed explicitly)
@@ -914,8 +933,7 @@ class CoVLAAgentPaper(nn.Module):
             truncation=True,
             max_length=128,
         ).to(device)
-        caption_embeds = self.language_model.get_input_embeddings()(caption_inputs.input_ids)
-        caption_embeds = caption_embeds.to(prompt_embeds.dtype)
+        caption_embeds = self.language_model.get_input_embeddings()(caption_inputs.input_ids).to(device=device, dtype=prompt_embeds.dtype)
         
         # Sequence: [vision] + [speed] + [nav_cmd?] + [prompt] + [caption] + [traj_queries]
         if nav_embeds is not None:
@@ -1044,15 +1062,15 @@ class CoVLAAgentPaper(nn.Module):
         dtype = next(self.language_model.parameters()).dtype
         
         # 1. Encode all frames with CLIP and project to LLM space
-        vision_embeds = self.encode_temporal_images(images).to(dtype)  # (B, num_frames*num_patches, llm_dim)
+        vision_embeds = self.encode_temporal_images(images).to(device=device, dtype=dtype)
         
         # 2. Add ego state embedding
-        speed_embeds = self.speed_embedding(ego_state.float().to(device))  # (B, llm_dim)
-        speed_embeds = speed_embeds.to(dtype).unsqueeze(1)  # (B, 1, llm_dim)
+        speed_embeds = self.speed_embedding(ego_state.float().to(device))
+        speed_embeds = speed_embeds.to(device=device, dtype=dtype).unsqueeze(1)
         
         # 3. Add nav command embedding (always required)
-        nav_embeds = self.nav_cmd_embedding(nav_cmd_idx.to(device))  # (B, llm_dim)
-        nav_embeds = nav_embeds.to(dtype).unsqueeze(1)  # (B, 1, llm_dim)
+        nav_embeds = self.nav_cmd_embedding(nav_cmd_idx.to(device))
+        nav_embeds = nav_embeds.to(device=device, dtype=dtype).unsqueeze(1)
         
         # 4. Use SAME prompt as training (must match forward()); CoT always on
         prompt = "USER: <image> List critical objects (e.g. lead vehicle, traffic lights) and describe the traffic scene. ASSISTANT: "
@@ -1061,7 +1079,7 @@ class CoVLAAgentPaper(nn.Module):
             return_tensors="pt",
             padding=True,
         ).to(device)
-        prompt_embeds = self.language_model.get_input_embeddings()(prompt_inputs.input_ids).to(dtype)
+        prompt_embeds = self.language_model.get_input_embeddings()(prompt_inputs.input_ids).to(device=device, dtype=dtype)
         
         # 5. Combine: [Vision] + [Speed] + [Nav] + [Prompt] (matches training forward())
         combined_embeds = torch.cat([vision_embeds, speed_embeds, nav_embeds, prompt_embeds], dim=1)
@@ -1070,7 +1088,11 @@ class CoVLAAgentPaper(nn.Module):
         # 5. Generate using HuggingFace generate() with inputs_embeds
         prefix_length = combined_embeds.shape[1]
         
+        # Pass dummy input_ids on device so generate() keeps all internal tensors on CUDA
+        # (8-bit quantized models can misplace tensors without this)
+        dummy_input_ids = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         outputs = self.language_model.generate(
+            input_ids=dummy_input_ids,
             inputs_embeds=combined_embeds,
             attention_mask=attention_mask,
             max_new_tokens=max_length,
@@ -1446,7 +1468,8 @@ class CoVLATrainerPaper:
     def evaluate(self, dataloader) -> Dict[str, float]:
         """Evaluate on validation/test set. Accepts Dataset or DataLoader. Includes R2 (lead vehicle) metrics."""
         if isinstance(dataloader, Dataset):
-            dataloader = DataLoader(dataloader, batch_size=self.config.batch_size, shuffle=False)
+            print(f"Evaluating {len(dataloader)} samples (batch_size={self.config.eval_batch_size})...")
+            dataloader = DataLoader(dataloader, batch_size=self.config.eval_batch_size, shuffle=False)
         self.model.eval()
         
         total_loss = 0
@@ -1543,7 +1566,7 @@ class CoVLATrainerPaper:
         if val_dataset:
             val_loader = DataLoader(
                 val_dataset,
-                batch_size=self.config.batch_size,
+                batch_size=self.config.eval_batch_size,
                 shuffle=False,
             )
         
