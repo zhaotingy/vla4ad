@@ -12,7 +12,7 @@
 ```python
 from covla_agent_paper import *
 
-config = CoVLAConfig(device="cuda", use_paper_model=True, quantize="8bit")
+config = CoVLAConfig(device="cuda", model_size="paper")
 # lead_car_data required; traffic_light_data optional (not used in R2 currently)
 train_dataset = CoVLADatasetPaper(states, captions_data, image_files, config, split="train",
     lead_car_data=lead_car_data, traffic_light_data=None)
@@ -114,7 +114,7 @@ Ego State → Linear Embedding ────────────────�
 ```python
 config = CoVLAConfig(
     # Model selection
-    use_paper_model=True,        # True: CLIP ViT-L + Mistral 7B, False: lightweight
+    model_size="paper",          # "light" (TinyLlama), "paper" (Mistral 7B), "mixtral" (8x7B MoE)
     
     # Quantization (QLoRA) — reduces LLM VRAM, enables larger batch size
     quantize="8bit",             # "none" (FP16), "8bit", or "4bit"
@@ -175,10 +175,10 @@ Quantize the base LLM to reduce VRAM and increase batch size. LoRA adapters rema
 
 ```python
 # 8-bit (recommended — best accuracy/memory tradeoff)
-config = CoVLAConfig(use_paper_model=True, quantize="8bit", batch_size=10)
+config = CoVLAConfig(model_size="paper", quantize="8bit", batch_size=10)
 
 # 4-bit (maximum memory savings)
-config = CoVLAConfig(use_paper_model=True, quantize="4bit", batch_size=16)
+config = CoVLAConfig(model_size="paper", quantize="4bit", batch_size=16)
 ```
 
 Existing checkpoints are compatible — they only contain LoRA + heads, not the base model weights. Requires `bitsandbytes` (`pip install bitsandbytes`).
@@ -978,14 +978,14 @@ Since the full dataset requires video frame extraction, you can also:
 from covla_agent_paper import *
 
 # ============================================================
-# Option A: Paper Model with 8-bit QLoRA (RECOMMENDED)
-# Mistral 7B quantized to 8-bit: ~7GB LLM → batch_size 10-12 on 24GB GPU
+# Option A: Paper Model — Mistral 7B (RECOMMENDED for 24GB GPU)
+# ~14GB FP16, batch_size 4-5, use gradient_accumulation for larger effective batch
 # ============================================================
 config = CoVLAConfig(
     device="cuda",
-    use_paper_model=True,      # CLIP ViT-L + Mistral 7B
-    quantize="8bit",           # 8-bit QLoRA — halves LLM memory, doubles batch size
-    batch_size=10,             # 8-bit allows larger batches (was 4-5 with FP16)
+    model_size="paper",        # CLIP ViT-L + Mistral 7B
+    batch_size=4,
+    gradient_accumulation_steps=4,  # effective batch = 16
     learning_rate=2e-5,        # Cosine decay to 1/3 of this
     
     # Data augmentation (helps prevent overfitting)
@@ -995,14 +995,14 @@ config = CoVLAConfig(
 )
 
 # ============================================================
-# Option B: Paper Model without quantization (FP16)
-# Requires ~24GB VRAM, batch_size limited to 4-5
+# Option B: Mixtral 8x7B MoE (for 48GB GPU, e.g. A6000)
+# ~26GB active FP16, better caption quality, batch_size 4-6
 # ============================================================
 # config = CoVLAConfig(
 #     device="cuda",
-#     use_paper_model=True,
-#     quantize="none",         # Full FP16
+#     model_size="mixtral",    # CLIP ViT-L + Mixtral 8x7B MoE
 #     batch_size=4,
+#     gradient_accumulation_steps=4,
 # )
 
 # ============================================================
@@ -1011,7 +1011,7 @@ config = CoVLAConfig(
 # ============================================================
 # config = CoVLAConfig(
 #     device="cuda",
-#     use_paper_model=False,  # CLIP ViT-B + TinyLlama 1.1B
+#     model_size="light",      # CLIP ViT-B + TinyLlama 1.1B
 #     batch_size=8,
 # )
 
@@ -1048,7 +1048,7 @@ model = load_model("covla_best.pt")
 model = load_model("covla_epoch_5.pt", device="cuda")
 
 # Option 3: Manual load (if you need custom config)
-config = CoVLAConfig(device="cuda", use_paper_model=False)
+config = CoVLAConfig(device="cuda", model_size="paper")
 model = CoVLAAgentPaper(config)
 model.load_trainable("covla_best.pt")
 ```
@@ -1070,10 +1070,11 @@ history = trainer.train(train_dataset, val_dataset, num_epochs=2)
 
 ### Model Comparison
 
-| Setting | Vision | Language | VRAM | Caption Quality | Approval |
+| Setting | Vision | Language | VRAM (FP16) | Caption Quality | Approval |
 |---------|--------|----------|------|-----------------|----------|
-| `use_paper_model=True` | CLIP ViT-L/14 | Mistral 7B | ~24GB | ⭐⭐⭐ Best | ✅ None |
-| `use_paper_model=False` | CLIP ViT-B/32 | TinyLlama 1.1B | ~8GB | ⭐ Basic | ✅ None |
+| `model_size="mixtral"` | CLIP ViT-L/14 | Mixtral 8x7B MoE | ~26GB active | ⭐⭐⭐⭐ Best | ✅ None |
+| `model_size="paper"` | CLIP ViT-L/14 | Mistral 7B | ~14GB | ⭐⭐⭐ Great | ✅ None |
+| `model_size="light"` | CLIP ViT-B/32 | TinyLlama 1.1B | ~2.2GB | ⭐ Basic | ✅ None |
 
 ### Saved Files
 
@@ -1092,9 +1093,10 @@ Only trainable weights are saved (LoRA, projections, embeddings). Base models ar
 - `NousResearch/Llama-2-7b-hf` - Community mirror, no approval
 
 ### Memory Tips
-- **Colab Pro+ with A100**: Use `use_paper_model=True` directly
-- **Colab Pro with V100**: May need 8-bit quantization
-- **Free Colab T4**: Use `use_paper_model=False`
+- **A6000 (48GB)**: Use `model_size="mixtral"` for best quality, or `model_size="paper"` with large batch
+- **A100 (40/80GB)**: Use `model_size="mixtral"` comfortably
+- **24GB GPU (3090/4090)**: Use `model_size="paper"` with `gradient_accumulation_steps=4`
+- **Free Colab T4 (16GB)**: Use `model_size="light"`
 
 ### Cell 7: Evaluate and Visualize
 ```python

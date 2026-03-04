@@ -153,24 +153,24 @@ class CoVLAConfig:
     - Speed embedding MLP
     - Trajectory query tokens
     
-    Set use_paper_model=True for exact paper architecture.
-    Set use_paper_model=False for lightweight version (free Colab).
+    Set model_size="paper" for exact paper architecture (Mistral 7B).
+    Set model_size="mixtral" for Mixtral 8x7B MoE (48GB GPU).
+    Set model_size="light" for lightweight version (free Colab).
     """
     
-    # Model selection
-    use_paper_model: bool = False  # True = paper models, False = lightweight
+    # Model selection: "light", "paper", or "mixtral"
+    model_size: str = "paper"  # "light" (~8GB), "paper" (~14GB FP16), "mixtral" (~26GB FP16 active)
     
-    # Paper models (CLIP ViT-L + 7B LLM, ~24GB VRAM)
-    # Using Mistral-7B as open alternative (no approval needed, similar quality)
-    # Other options if you have access:
-    # - "meta-llama/Llama-2-7b-hf" (requires Meta approval)
-    # - "meta-llama/Llama-2-7b-chat-hf" (requires Meta approval)
-    vision_encoder_paper: str = "openai/clip-vit-large-patch14"
-    language_model_paper: str = "mistralai/Mistral-7B-Instruct-v0.2"  # Open, no approval
-    
-    # Lightweight models (CLIP ViT-B + TinyLlama, ~8GB VRAM)
+    # Model options
+    # light:   CLIP ViT-B/32 + TinyLlama 1.1B   (~8GB VRAM, free Colab)
+    # paper:   CLIP ViT-L/14 + Mistral 7B        (~14GB FP16, 24GB GPU)
+    # mixtral: CLIP ViT-L/14 + Mixtral 8x7B MoE  (~26GB active FP16, 48GB GPU)
     vision_encoder_light: str = "openai/clip-vit-base-patch32"
     language_model_light: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    vision_encoder_paper: str = "openai/clip-vit-large-patch14"
+    language_model_paper: str = "mistralai/Mistral-7B-Instruct-v0.2"
+    vision_encoder_mixtral: str = "openai/clip-vit-large-patch14"
+    language_model_mixtral: str = "mistralai/Mixtral-8x7B-Instruct-v0.1"
     
     # Trajectory (paper uses 10 points, sampled from 60)
     trajectory_points: int = 10  # Paper: "10 points uniformly sampled"
@@ -239,11 +239,11 @@ class CoVLAConfig:
     
     @property
     def vision_encoder(self) -> str:
-        return self.vision_encoder_paper if self.use_paper_model else self.vision_encoder_light
+        return getattr(self, f"vision_encoder_{self.model_size}")
     
     @property
     def language_model(self) -> str:
-        return self.language_model_paper if self.use_paper_model else self.language_model_light
+        return getattr(self, f"language_model_{self.model_size}")
 
 
 # =============================================================================
@@ -648,6 +648,10 @@ class CoVLAAgentPaper(nn.Module):
                 bnb_4bit_quant_type="nf4",
             )
             print("  Loading LLM in 4-bit (QLoRA NF4) — ~75% less VRAM")
+        # MoE models (Mixtral) need device_map to handle expert routing across memory
+        if config.model_size == "mixtral":
+            load_kwargs["device_map"] = "auto"
+            print("  Loading MoE model with device_map='auto'")
         self.language_model = AutoModelForCausalLM.from_pretrained(
             config.language_model,
             **load_kwargs,
@@ -704,7 +708,7 @@ class CoVLAAgentPaper(nn.Module):
         # Print model info
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        model_type = "PAPER" if config.use_paper_model else "LIGHTWEIGHT"
+        model_type = config.model_size.upper()
         print(f"✓ CoVLA-Agent initialized ({model_type})")
         print(f"  Vision: {config.vision_encoder}")
         print(f"  Language: {config.language_model}")
@@ -715,19 +719,21 @@ class CoVLAAgentPaper(nn.Module):
         print(f"  Trainable: {trainable:,}")
     
     def _apply_lora(self):
-        """Apply LoRA to language model."""
+        """Apply LoRA to language model. Targets attention for standard models, attention + expert gates for MoE."""
         try:
             from peft import get_peft_model, LoraConfig, TaskType
+            
+            target_modules = ["q_proj", "v_proj"]
             
             lora_config = LoraConfig(
                 r=self.config.lora_rank,
                 lora_alpha=self.config.lora_rank * 2,
-                target_modules=["q_proj", "v_proj"],
+                target_modules=target_modules,
                 lora_dropout=0.1,
                 task_type=TaskType.CAUSAL_LM,
             )
             self.language_model = get_peft_model(self.language_model, lora_config)
-            print("✓ LoRA applied")
+            print(f"✓ LoRA applied (targets: {target_modules})")
         except ImportError:
             print("⚠ PEFT not installed, training full model")
     
