@@ -786,11 +786,14 @@ class CoVLAAgentPaper(nn.Module):
         if 'nav_cmd_embedding' in checkpoint and self.use_nav_cmd:
             self.nav_cmd_embedding.load_state_dict(checkpoint['nav_cmd_embedding'])
         
-        # Load LoRA weights
+        # Load LoRA weights (strict=False so quant buffers like .absmax/.quant_map from 4bit are OK if not in current model)
         if 'lora' in checkpoint and hasattr(self.language_model, 'peft_config'):
-            current_state = self.language_model.state_dict()
-            current_state.update(checkpoint['lora'])
-            self.language_model.load_state_dict(current_state)
+            lora_state = checkpoint['lora']
+            result = self.language_model.load_state_dict(lora_state, strict=False)
+            if result.missing_keys:
+                print(f"  Missing keys (kept as-is): {len(result.missing_keys)}")
+            if result.unexpected_keys:
+                print(f"  Unexpected keys (ignored): {len(result.unexpected_keys)}")
         
         # Move entire model to device
         self.to(self.config.device)
