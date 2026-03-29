@@ -216,6 +216,13 @@ class CoVLAConfig:
     
     # Extra R2 loss: CE on tokens before the first \n in caption (= R2 prefix)
     caption_r2_weight: float = 1.0
+    # Val R2 metrics (generate_caption): 1-based epoch index; skip before this to save time.
+    # R2 is always computed on the last epoch as well (so 1-epoch runs still get R2).
+    eval_r2_from_epoch: int = 2
+    
+    # Trajectory-only distillation: add distill_traj_weight * MSE(student pred, frozen teacher pred).
+    # Teacher forward uses GT captions for conditioning (same as student). Works across different LLM/tokenizers.
+    distill_traj_weight: float = 0.0  # 0 = off; try ~0.2–1.0 with teacher=CoVLAAgentPaper(...)
     
     # Data augmentation (only applied during training)
     augment_trajectory: bool = True  # Add noise to GT trajectory
@@ -1010,7 +1017,7 @@ class CoVLAAgentPaper(nn.Module):
             caption_len = caption_inputs.input_ids.shape[1]
             pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
             targets = caption_inputs.input_ids
-            caption_logits = logits[:, prefix_len-1:prefix_len+caption_len-1, :]  # (B, L, V)
+            caption_logits = logits[:, prefix_len - 1 : prefix_len + caption_len - 1, :]  # (B, L, V)
             
             caption_loss = F.cross_entropy(
                 caption_logits.reshape(-1, caption_logits.size(-1)),
@@ -1247,13 +1254,24 @@ class CoVLATrainerPaper:
     Trainer following paper's experiment setup.
     
     - Combined loss: 0.5 * caption_loss + 0.5 * trajectory_loss
+    - Optional trajectory distillation: distill_traj_weight * MSE(student, frozen teacher), same GT captions for both
     - Metrics: ADE, FDE
     """
     
-    def __init__(self, model: CoVLAAgentPaper, config: CoVLAConfig):
+    def __init__(
+        self,
+        model: CoVLAAgentPaper,
+        config: CoVLAConfig,
+        teacher: Optional[CoVLAAgentPaper] = None,
+    ):
         self.model = model.to(config.device)
         self.config = config
         self.device = config.device
+        self.teacher = teacher
+        if self.teacher is not None:
+            self.teacher.eval()
+            for p in self.teacher.parameters():
+                p.requires_grad = False
         
         # Optimizer
         trainable = [p for p in model.parameters() if p.requires_grad]
@@ -1270,6 +1288,25 @@ class CoVLATrainerPaper:
             'val_ade': [],
             'val_fde': [],
         }
+    
+    def _teacher_pred_trajectory(
+        self,
+        images: torch.Tensor,
+        captions: List[str],
+        ego_state: torch.Tensor,
+        nav_cmd_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Frozen teacher forward (no task loss); GT captions for conditioning. Returns traj on images.device."""
+        t_dev = next(self.teacher.parameters()).device
+        with torch.no_grad():
+            te = self.teacher(
+                images.to(t_dev),
+                captions=captions,
+                trajectories=None,
+                ego_state=ego_state.to(t_dev),
+                nav_cmd_idx=nav_cmd_idx.to(t_dev),
+            )
+        return te['pred_trajectory'].to(images.device)
     
     def train_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
         """
@@ -1288,9 +1325,14 @@ class CoVLATrainerPaper:
         total_caption_loss = 0
         total_r2_loss = 0
         total_smooth_loss = 0
+        total_distill_traj = 0
         n_batches = 0
         global_step = getattr(self, '_global_step', -1)
         accum_steps = self.config.gradient_accumulation_steps
+        use_distill = (
+            self.teacher is not None
+            and self.config.distill_traj_weight > 0
+        )
         
         for batch_idx, batch in enumerate(dataloader):
             images = batch['images'].to(self.device)  # (B, num_frames, C, H, W)
@@ -1308,7 +1350,15 @@ class CoVLATrainerPaper:
                         ego_state=ego_state,
                         nav_cmd_idx=nav_cmd_idx,
                     )
-                    loss = output['loss'] / accum_steps  # Scale loss for accumulation
+                    distill_traj = torch.tensor(0.0, device=self.device)
+                    if use_distill:
+                        t_pred = self._teacher_pred_trajectory(
+                            images, captions, ego_state, nav_cmd_idx
+                        ).to(dtype=output['pred_trajectory'].dtype)
+                        distill_traj = F.mse_loss(output['pred_trajectory'], t_pred)
+                    loss = (
+                        output["loss"] + self.config.distill_traj_weight * distill_traj
+                    ) / accum_steps
                 
                 self.scaler.scale(loss).backward()
                 
@@ -1325,7 +1375,15 @@ class CoVLATrainerPaper:
                     ego_state=ego_state,
                     nav_cmd_idx=nav_cmd_idx,
                 )
-                loss = output['loss'] / accum_steps
+                distill_traj = torch.tensor(0.0, device=self.device)
+                if use_distill:
+                    t_pred = self._teacher_pred_trajectory(
+                        images, captions, ego_state, nav_cmd_idx
+                    ).to(dtype=output['pred_trajectory'].dtype)
+                    distill_traj = F.mse_loss(output['pred_trajectory'], t_pred)
+                loss = (
+                    output["loss"] + self.config.distill_traj_weight * distill_traj
+                ) / accum_steps
                 loss.backward()
                 
                 if (batch_idx + 1) % accum_steps == 0:
@@ -1337,6 +1395,7 @@ class CoVLATrainerPaper:
             total_caption_loss += output.get('caption_loss', torch.tensor(0)).item()
             total_r2_loss += output['r2_loss'].item()
             total_smooth_loss += output.get('smoothing_loss', torch.tensor(0)).item()
+            total_distill_traj += distill_traj.item()
             n_batches += 1
             global_step += 1
             
@@ -1352,6 +1411,7 @@ class CoVLATrainerPaper:
             'caption_loss': total_caption_loss / n_batches,
             'r2_loss': total_r2_loss / n_batches,
             'smoothing_loss': total_smooth_loss / n_batches,
+            'distill_traj_loss': total_distill_traj / n_batches,
         }
     
     def _visualize_training_sample(self, batch, output, step):
@@ -1401,6 +1461,17 @@ class CoVLATrainerPaper:
         pred_traj = eval_output['pred_trajectory'][0].cpu().numpy()
         caption = batch['caption'][0] if isinstance(batch['caption'], list) else batch['caption']
         
+        teacher_traj = None
+        if self.teacher is not None:
+            with torch.no_grad():
+                tt = self._teacher_pred_trajectory(
+                    images_input,
+                    [caption],
+                    batch['ego_state'][0:1].to(self.device),
+                    nav_cmd_idx,
+                )
+            teacher_traj = tt[0].cpu().numpy()
+        
         # Get ego state and denormalize
         ego_state_raw = batch['ego_state'][0].cpu().numpy()  # (3,) normalized
         ego = denormalize_ego_state(ego_state_raw)
@@ -1444,6 +1515,10 @@ class CoVLATrainerPaper:
         ax2 = axes[1]
         plot_trajectory_on_image(last_frame, gt_traj, extrinsic, intrinsic, color='green', label='GT', ax=ax2)
         plot_trajectory_on_image(last_frame, pred_traj, extrinsic, intrinsic, color='red', label='Pred', ax=ax2)
+        if teacher_traj is not None:
+            plot_trajectory_on_image(
+                last_frame, teacher_traj, extrinsic, intrinsic, color='darkorange', label='Teacher', ax=ax2
+            )
         plot_trajectory_on_image(last_frame, traj_physics, extrinsic, intrinsic, color='blue', label='Physics', ax=ax2)
         ax2.legend(loc='upper right')
         ax2.set_title(f"Current Frame | Nav: {nav_cmd} | ADE: {ade:.2f}m | FDE: {fde:.2f}m | {ego['vEgo']:.1f} m/s")
@@ -1452,6 +1527,16 @@ class CoVLATrainerPaper:
         ax3 = axes[2]
         ax3.plot(gt_traj[:, 0], gt_traj[:, 1], 'g-o', markersize=5, label='GT')
         ax3.plot(pred_traj[:, 0], pred_traj[:, 1], 'r-o', markersize=5, label='Pred')
+        if teacher_traj is not None:
+            ax3.plot(
+                teacher_traj[:, 0],
+                teacher_traj[:, 1],
+                color='darkorange',
+                marker='^',
+                markersize=4,
+                label='Teacher',
+                linewidth=1.5,
+            )
         ax3.plot(traj_physics[:, 0], traj_physics[:, 1], 'b-s', markersize=4, 
                  label='Physics', alpha=0.7, linewidth=1.5)
         ax3.scatter([0], [0], c='blue', s=100, marker='*', label='Ego', zorder=5)
@@ -1474,8 +1559,9 @@ class CoVLATrainerPaper:
         self.model.train()
     
     @torch.no_grad()
-    def evaluate(self, dataloader) -> Dict[str, float]:
-        """Evaluate on validation/test set. Accepts Dataset or DataLoader. Includes R2 (lead vehicle) metrics."""
+    def evaluate(self, dataloader, compute_r2: bool = True) -> Dict[str, float]:
+        """Evaluate on validation/test set. Accepts Dataset or DataLoader.
+        When compute_r2 is False, skips caption generation (faster); R2 fields are NaN."""
         if isinstance(dataloader, Dataset):
             print(f"Evaluating {len(dataloader)} samples (batch_size={self.config.eval_batch_size})...")
             dataloader = DataLoader(dataloader, batch_size=self.config.eval_batch_size, shuffle=False)
@@ -1508,24 +1594,25 @@ class CoVLATrainerPaper:
             all_gt.append(trajectories.cpu())
             n_batches += 1
             
-            # R2: generate captions and parse lead vehicle (GT vs pred)
-            pred_captions = self.model.generate_caption(images, ego_state, nav_cmd_idx)
-            for gt_cap, pred_cap in zip(captions, pred_captions):
-                has_lead_gt, x_gt, y_gt = parse_r2_from_caption(gt_cap)
-                has_lead_pred, x_pred, y_pred = parse_r2_from_caption(pred_cap)
-                if has_lead_pred:
-                    n_pred_lead += 1
-                if has_lead_gt:
-                    n_gt_lead += 1
+            # R2: generate captions and parse lead vehicle (GT vs pred) — optional (expensive)
+            if compute_r2:
+                pred_captions = self.model.generate_caption(images, ego_state, nav_cmd_idx)
+                for gt_cap, pred_cap in zip(captions, pred_captions):
+                    has_lead_gt, x_gt, y_gt = parse_r2_from_caption(gt_cap)
+                    has_lead_pred, x_pred, y_pred = parse_r2_from_caption(pred_cap)
                     if has_lead_pred:
-                        n_correct_lead += 1
-                        if x_gt is not None and y_gt is not None and x_pred is not None and y_pred is not None:
-                            dist = np.sqrt((x_pred - x_gt) ** 2 + (y_pred - y_gt) ** 2)
-                            r2_dist_errors.append(float(dist))
-                else:
-                    n_gt_none += 1
-                    if not has_lead_pred:
-                        n_correct_none += 1
+                        n_pred_lead += 1
+                    if has_lead_gt:
+                        n_gt_lead += 1
+                        if has_lead_pred:
+                            n_correct_lead += 1
+                            if x_gt is not None and y_gt is not None and x_pred is not None and y_pred is not None:
+                                dist = np.sqrt((x_pred - x_gt) ** 2 + (y_pred - y_gt) ** 2)
+                                r2_dist_errors.append(float(dist))
+                    else:
+                        n_gt_none += 1
+                        if not has_lead_pred:
+                            n_correct_none += 1
         
         # Trajectory metrics
         all_pred = torch.cat(all_pred, dim=0)
@@ -1534,13 +1621,19 @@ class CoVLATrainerPaper:
         fde = compute_fde(all_pred, all_gt)
         
         # R2 metrics: precision = when we predicted lead, % correct; recall = when GT lead, % we predicted lead
-        total_r2 = n_gt_lead + n_gt_none
-        n_correct_presence = n_correct_lead + n_correct_none
-        r2_acc = (n_correct_presence / total_r2) if total_r2 else 0.0
-        r2_recall = (n_correct_lead / n_gt_lead) if n_gt_lead else 0.0   # TP / (TP+FN)
-        r2_precision = (n_correct_lead / n_pred_lead) if n_pred_lead else 0.0  # TP / (TP+FP)
-        r2_ratio_lead = (n_gt_lead / total_r2) if total_r2 else 0.0      # fraction of val samples with lead
-        r2_dist_mean = float(np.mean(r2_dist_errors)) if r2_dist_errors else float('nan')
+        if not compute_r2:
+            nan = float('nan')
+            r2_acc = r2_recall = r2_precision = r2_ratio_lead = nan
+            r2_dist_mean = nan
+            n_gt_lead = n_correct_lead = 0
+        else:
+            total_r2 = n_gt_lead + n_gt_none
+            n_correct_presence = n_correct_lead + n_correct_none
+            r2_acc = (n_correct_presence / total_r2) if total_r2 else 0.0
+            r2_recall = (n_correct_lead / n_gt_lead) if n_gt_lead else 0.0   # TP / (TP+FN)
+            r2_precision = (n_correct_lead / n_pred_lead) if n_pred_lead else 0.0  # TP / (TP+FP)
+            r2_ratio_lead = (n_gt_lead / total_r2) if total_r2 else 0.0      # fraction of val samples with lead
+            r2_dist_mean = float(np.mean(r2_dist_errors)) if r2_dist_errors else float('nan')
         
         return {
             'loss': total_loss / n_batches,
@@ -1562,6 +1655,11 @@ class CoVLATrainerPaper:
         num_epochs: int = None,
     ):
         """Full training loop."""
+        if self.teacher is None and self.config.distill_traj_weight > 0:
+            raise ValueError(
+                "distill_traj_weight > 0 requires teacher=CoVLAAgentPaper(...) in CoVLATrainerPaper(...)"
+            )
+        
         num_epochs = num_epochs or self.config.num_epochs
         
         train_loader = DataLoader(
@@ -1597,6 +1695,11 @@ class CoVLATrainerPaper:
             f"Batch size: {self.config.batch_size}",
             f"Learning rate: {self.config.learning_rate} → {self.config.learning_rate/3:.1e} (cosine decay)",
             f"Loss weights: caption={self.config.caption_weight}, trajectory={self.config.trajectory_weight}",
+            (
+                f"Distill: trajectory MSE vs frozen teacher, weight={self.config.distill_traj_weight}"
+                if self.config.distill_traj_weight > 0
+                else None
+            ),
             "=" * 70,
             "",
         ]
@@ -1618,9 +1721,14 @@ class CoVLATrainerPaper:
             train_metrics = self.train_epoch(train_loader)
             self.history['train_loss'].append(train_metrics['loss'])
             
-            # Validate
+            # Validate (R2 via generate_caption from eval_r2_from_epoch onward, and always on last epoch)
             if val_loader:
-                val_metrics = self.evaluate(val_loader)
+                epoch_1based = epoch + 1
+                compute_r2 = (
+                    epoch_1based >= self.config.eval_r2_from_epoch
+                    or epoch == num_epochs - 1
+                )
+                val_metrics = self.evaluate(val_loader, compute_r2=compute_r2)
                 self.history['val_loss'].append(val_metrics['loss'])
                 self.history['val_ade'].append(val_metrics['ade'])
                 self.history['val_fde'].append(val_metrics['fde'])
@@ -1638,12 +1746,17 @@ class CoVLATrainerPaper:
                           f"{val_metrics['ade']:<8.3f}{val_metrics['fde']:<8.3f}")
                 print(summary)
                 self._epoch_summaries.append(summary)
+                if self.config.distill_traj_weight > 0:
+                    print(f"      distill_traj: {train_metrics['distill_traj_loss']:.6f} (MSE vs teacher)")
                 # R2 (lead vehicle): precision & recall for "lead" class, dist_err when both have coords
-                r2_dist = val_metrics['r2_dist_mean']
-                r2_dist_s = f"{r2_dist:.2f}" if not np.isnan(r2_dist) else "n/a"
-                print(f"      R2: acc={val_metrics['r2_acc']:.3f} prec={val_metrics['r2_precision']:.3f} rec={val_metrics['r2_recall']:.3f} "
-                      f"lead_ratio={val_metrics['r2_ratio_lead']:.2f} dist_err(m)={r2_dist_s} "
-                      f"({val_metrics['r2_n_correct_lead']}/{val_metrics['r2_n_lead']} lead detected)")
+                if compute_r2:
+                    r2_dist = val_metrics['r2_dist_mean']
+                    r2_dist_s = f"{r2_dist:.2f}" if not np.isnan(r2_dist) else "n/a"
+                    print(f"      R2: acc={val_metrics['r2_acc']:.3f} prec={val_metrics['r2_precision']:.3f} rec={val_metrics['r2_recall']:.3f} "
+                          f"lead_ratio={val_metrics['r2_ratio_lead']:.2f} dist_err(m)={r2_dist_s} "
+                          f"({val_metrics['r2_n_correct_lead']}/{val_metrics['r2_n_lead']} lead detected)")
+                else:
+                    print(f"      R2: (skipped — runs from epoch {self.config.eval_r2_from_epoch}+ and on final epoch)")
                 
                 # Save best model
                 if val_metrics['ade'] < best_ade:
@@ -1657,6 +1770,8 @@ class CoVLATrainerPaper:
                           f"{train_metrics['smoothing_loss']:<10.4f}")
                 print(summary)
                 self._epoch_summaries.append(summary)
+                if self.config.distill_traj_weight > 0:
+                    print(f"      distill_traj: {train_metrics['distill_traj_loss']:.6f} (MSE vs teacher)")
             
             # Save checkpoint each epoch
             self.model.save_trainable(f"covla_epoch_{epoch+1}.pt")
