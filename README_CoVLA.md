@@ -150,8 +150,63 @@ config = CoVLAConfig(
     # LoRA fine-tuning
     use_lora=True,
     lora_rank=16,
+    
+    # Validation R2 metrics (expensive: runs teacher-style caption generation)
+    eval_r2_from_epoch=2,        # 1-based: skip R2 on epoch 1; always computed on last epoch too
+    
+    # Trajectory distillation (optional — train smaller student against frozen teacher)
+    distill_traj_weight=0.0,         # MSE on final (x,y,z) trajectory vs teacher
+    distill_traj_feat_weight=0.0,    # MSE on LLM hiddens at trajectory queries vs teacher (before Trajectory MLP)
+    distill_teacher_llm_dim=None,     # Teacher LM hidden_size if using feat distill (e.g. 4096 for Mistral 7B)
 )
 ```
+
+### Trajectory distillation (paper / large → light student)
+
+Train a **student** (`model_size="light"`, etc.) with optional extra terms on top of the usual caption + trajectory + R2 losses. The teacher forward uses the **same batch GT captions** for conditioning as the student (works across **different** tokenizers).
+
+| Loss | What it matches |
+|------|-----------------|
+| **`distill_traj_weight`** | Final predicted **trajectory** (after Trajectory MLP) vs teacher |
+| **`distill_traj_feat_weight`** | **LLM hidden states** at the 10 trajectory-query positions (**before** the Trajectory MLP) vs teacher. If student and teacher hidden sizes differ (e.g. 2048 vs 4096), the student gets a **learned Linear** into the teacher’s dimension. |
+
+1. Train or load a **teacher** checkpoint (e.g. `model_size="paper"`). Note `teacher.language_model.config.hidden_size` for `distill_teacher_llm_dim` if you enable feature distillation.
+2. Build **student** `CoVLAConfig` with `distill_traj_weight > 0` and/or `distill_traj_feat_weight > 0` (set `distill_teacher_llm_dim` when feat weight &gt; 0).
+3. **Align** teacher and student configs for data layout: `use_nav_cmd`, `num_history_frames`, `use_extended_ego_state`, `image_size`, etc.
+4. Pass the frozen teacher into the trainer:
+
+```python
+from covla_agent_paper import CoVLAConfig, CoVLAAgentPaper, CoVLATrainerPaper, CoVLADatasetPaper
+
+paper_cfg = CoVLAConfig(device="cuda", model_size="paper", batch_size=4, ...)
+teacher = CoVLAAgentPaper(paper_cfg)
+teacher.load_trainable("covla_paper_best.pt")
+teacher.eval()
+
+light_cfg = CoVLAConfig(
+    device="cuda",
+    model_size="light",
+    distill_traj_weight=0.3,
+    # Optional: also match trajectory-query features (set teacher hidden size, e.g. Mistral 7B → 4096)
+    # distill_traj_feat_weight=0.1,
+    # distill_teacher_llm_dim=4096,
+    use_nav_cmd=paper_cfg.use_nav_cmd,
+    num_history_frames=paper_cfg.num_history_frames,
+    use_extended_ego_state=paper_cfg.use_extended_ego_state,
+    # ...match other layout flags...
+)
+student = CoVLAAgentPaper(light_cfg)
+trainer = CoVLATrainerPaper(student, light_cfg, teacher=teacher)
+history = trainer.train(train_dataset, val_dataset, num_epochs=10)
+```
+
+**VRAM:** Two full models can exceed one GPU; put `teacher.to("cpu")` and keep the student on CUDA (slower teacher forward) or use a second GPU.
+
+**Logging:** Training prints `distill_traj` / `distill_traj_feat` when those weights are &gt; 0. If `teacher` is set, periodic `_visualize_training_sample` plots include the **Teacher** trajectory (dark orange) on the current frame and bird’s-eye view alongside GT, student pred, and physics.
+
+### Validation R2 scheduling
+
+`eval_r2_from_epoch` (default `2`): validation **R2** metrics (lead-vehicle parsing from **generated** captions) are skipped before that epoch to save time, but **always** run on the **last** epoch so a single-epoch run still gets R2.
 
 ### Data Augmentation
 
@@ -1027,6 +1082,8 @@ model = CoVLAAgentPaper(config)
 # Train (auto-saves after each epoch)
 # Learning rate: cosine decay from 2e-5 to 6.7e-6
 trainer = CoVLATrainerPaper(model, config)
+# Optional: trajectory distillation — load frozen teacher, set config.distill_traj_weight > 0, then:
+# trainer = CoVLATrainerPaper(student, light_config, teacher=teacher_model)
 history = trainer.train(train_dataset, val_dataset, num_epochs=4)
 
 # Saves automatically:
