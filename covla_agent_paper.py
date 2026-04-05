@@ -223,6 +223,10 @@ class CoVLAConfig:
     # Trajectory-only distillation: add distill_traj_weight * MSE(student pred, frozen teacher pred).
     # Teacher forward uses GT captions for conditioning (same as student). Works across different LLM/tokenizers.
     distill_traj_weight: float = 0.0  # 0 = off; try ~0.2–1.0 with teacher=CoVLAAgentPaper(...)
+    # Trajectory-query hidden distillation: MSE(projector(student LLM hiddens), teacher hiddens) at the 10 query
+    # positions (before Trajectory MLP). Student gets a Linear(student_llm_dim -> distill_teacher_llm_dim).
+    distill_traj_feat_weight: float = 0.0
+    distill_teacher_llm_dim: Optional[int] = None  # e.g. 4096 for Mistral-7B; required if distill_traj_feat_weight > 0
     
     # Data augmentation (only applied during training)
     augment_trajectory: bool = True  # Add noise to GT trajectory
@@ -709,6 +713,15 @@ class CoVLAAgentPaper(nn.Module):
             coord_dim=config.trajectory_dim,
         )
         
+        # Optional projector for trajectory-query feature distillation (student hidden -> teacher hidden size)
+        self.traj_feat_projector: Optional[nn.Linear] = None
+        if config.distill_traj_feat_weight > 0:
+            if config.distill_teacher_llm_dim is None:
+                raise ValueError(
+                    "distill_traj_feat_weight > 0 requires distill_teacher_llm_dim (teacher language_model.config.hidden_size)"
+                )
+            self.traj_feat_projector = nn.Linear(self.llm_dim, config.distill_teacher_llm_dim)
+        
         # Loss weights
         self.smoothing_weight = config.smoothing_weight
         
@@ -759,6 +772,9 @@ class CoVLAAgentPaper(nn.Module):
             'config': self.config,
         }
         
+        if self.traj_feat_projector is not None:
+            trainable_state['traj_feat_projector'] = self.traj_feat_projector.state_dict()
+        
         # Save nav_cmd_embedding if used
         if self.use_nav_cmd:
             trainable_state['nav_cmd_embedding'] = self.nav_cmd_embedding.state_dict()
@@ -788,6 +804,9 @@ class CoVLAAgentPaper(nn.Module):
         self.speed_embedding.load_state_dict(checkpoint['speed_embedding'])
         self.trajectory_queries.data = checkpoint['trajectory_queries'].to(self.config.device)
         self.trajectory_mlp.load_state_dict(checkpoint['trajectory_mlp'])
+        
+        if 'traj_feat_projector' in checkpoint and self.traj_feat_projector is not None:
+            self.traj_feat_projector.load_state_dict(checkpoint['traj_feat_projector'])
         
         # Load nav_cmd_embedding if present
         if 'nav_cmd_embedding' in checkpoint and self.use_nav_cmd:
@@ -998,6 +1017,7 @@ class CoVLAAgentPaper(nn.Module):
         result = {
             'pred_trajectory': pred_trajectory,
             'hidden_states': hidden_states,
+            'traj_query_outputs': traj_query_outputs,
         }
         
         # Calculate losses if training (trajectories provided)
@@ -1254,7 +1274,8 @@ class CoVLATrainerPaper:
     Trainer following paper's experiment setup.
     
     - Combined loss: 0.5 * caption_loss + 0.5 * trajectory_loss
-    - Optional trajectory distillation: distill_traj_weight * MSE(student, frozen teacher), same GT captions for both
+    - Optional trajectory distillation: distill_traj_weight * MSE(student pred, frozen teacher pred);
+      distill_traj_feat_weight * MSE(projector(student traj-query hiddens), teacher traj-query hiddens)
     - Metrics: ADE, FDE
     """
     
@@ -1289,14 +1310,14 @@ class CoVLATrainerPaper:
             'val_fde': [],
         }
     
-    def _teacher_pred_trajectory(
+    def _teacher_distill_forward(
         self,
         images: torch.Tensor,
         captions: List[str],
         ego_state: torch.Tensor,
         nav_cmd_idx: torch.Tensor,
-    ) -> torch.Tensor:
-        """Frozen teacher forward (no task loss); GT captions for conditioning. Returns traj on images.device."""
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One frozen teacher forward (GT captions): (pred_trajectory, traj_query_outputs) on images.device."""
         t_dev = next(self.teacher.parameters()).device
         with torch.no_grad():
             te = self.teacher(
@@ -1306,7 +1327,66 @@ class CoVLATrainerPaper:
                 ego_state=ego_state.to(t_dev),
                 nav_cmd_idx=nav_cmd_idx.to(t_dev),
             )
-        return te['pred_trajectory'].to(images.device)
+        dev = images.device
+        return te['pred_trajectory'].to(dev), te['traj_query_outputs'].to(dev)
+    
+    def _teacher_pred_trajectory(
+        self,
+        images: torch.Tensor,
+        captions: List[str],
+        ego_state: torch.Tensor,
+        nav_cmd_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Frozen teacher trajectory prediction (viz / eval). Same forward as distillation."""
+        return self._teacher_distill_forward(images, captions, ego_state, nav_cmd_idx)[0]
+    
+    def _compute_distill_losses(
+        self,
+        images: torch.Tensor,
+        captions: List[str],
+        ego_state: torch.Tensor,
+        nav_cmd_idx: torch.Tensor,
+        output: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-term MSE vs teacher; one teacher forward if any distill weight > 0."""
+        device = images.device
+        zero = torch.tensor(0.0, device=device)
+        w_traj = self.config.distill_traj_weight
+        w_feat = self.config.distill_traj_feat_weight
+        if w_traj <= 0 and w_feat <= 0:
+            return zero, zero
+        t_pred, t_feat = self._teacher_distill_forward(images, captions, ego_state, nav_cmd_idx)
+        distill_traj = (
+            F.mse_loss(output['pred_trajectory'], t_pred.to(dtype=output['pred_trajectory'].dtype))
+            if w_traj > 0
+            else zero
+        )
+        distill_traj_feat = (
+            F.mse_loss(
+                self.model.traj_feat_projector(output['traj_query_outputs']).float(),
+                t_feat.float(),
+            )
+            if w_feat > 0
+            else zero
+        )
+        return distill_traj, distill_traj_feat
+    
+    def _distill_header_suffix(self) -> str:
+        """Extra table columns when trajectory / feature distillation is enabled."""
+        s = ""
+        if self.config.distill_traj_weight > 0:
+            s += f"{'dTraj':<10}"
+        if self.config.distill_traj_feat_weight > 0:
+            s += f"{'dFeat':<10}"
+        return s
+    
+    def _distill_metrics_suffix(self, train_metrics: Dict[str, float]) -> str:
+        s = ""
+        if self.config.distill_traj_weight > 0:
+            s += f"{train_metrics['distill_traj_loss']:<10.4f}"
+        if self.config.distill_traj_feat_weight > 0:
+            s += f"{train_metrics['distill_traj_feat_loss']:<10.4f}"
+        return s
     
     def train_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
         """
@@ -1326,13 +1406,10 @@ class CoVLATrainerPaper:
         total_r2_loss = 0
         total_smooth_loss = 0
         total_distill_traj = 0
+        total_distill_traj_feat = 0
         n_batches = 0
         global_step = getattr(self, '_global_step', -1)
         accum_steps = self.config.gradient_accumulation_steps
-        use_distill = (
-            self.teacher is not None
-            and self.config.distill_traj_weight > 0
-        )
         
         for batch_idx, batch in enumerate(dataloader):
             images = batch['images'].to(self.device)  # (B, num_frames, C, H, W)
@@ -1350,14 +1427,13 @@ class CoVLATrainerPaper:
                         ego_state=ego_state,
                         nav_cmd_idx=nav_cmd_idx,
                     )
-                    distill_traj = torch.tensor(0.0, device=self.device)
-                    if use_distill:
-                        t_pred = self._teacher_pred_trajectory(
-                            images, captions, ego_state, nav_cmd_idx
-                        ).to(dtype=output['pred_trajectory'].dtype)
-                        distill_traj = F.mse_loss(output['pred_trajectory'], t_pred)
+                    distill_traj, distill_traj_feat = self._compute_distill_losses(
+                        images, captions, ego_state, nav_cmd_idx, output
+                    )
                     loss = (
-                        output["loss"] + self.config.distill_traj_weight * distill_traj
+                        output["loss"]
+                        + self.config.distill_traj_weight * distill_traj
+                        + self.config.distill_traj_feat_weight * distill_traj_feat
                     ) / accum_steps
                 
                 self.scaler.scale(loss).backward()
@@ -1375,14 +1451,13 @@ class CoVLATrainerPaper:
                     ego_state=ego_state,
                     nav_cmd_idx=nav_cmd_idx,
                 )
-                distill_traj = torch.tensor(0.0, device=self.device)
-                if use_distill:
-                    t_pred = self._teacher_pred_trajectory(
-                        images, captions, ego_state, nav_cmd_idx
-                    ).to(dtype=output['pred_trajectory'].dtype)
-                    distill_traj = F.mse_loss(output['pred_trajectory'], t_pred)
+                distill_traj, distill_traj_feat = self._compute_distill_losses(
+                    images, captions, ego_state, nav_cmd_idx, output
+                )
                 loss = (
-                    output["loss"] + self.config.distill_traj_weight * distill_traj
+                    output["loss"]
+                    + self.config.distill_traj_weight * distill_traj
+                    + self.config.distill_traj_feat_weight * distill_traj_feat
                 ) / accum_steps
                 loss.backward()
                 
@@ -1396,6 +1471,7 @@ class CoVLATrainerPaper:
             total_r2_loss += output['r2_loss'].item()
             total_smooth_loss += output.get('smoothing_loss', torch.tensor(0)).item()
             total_distill_traj += distill_traj.item()
+            total_distill_traj_feat += distill_traj_feat.item()
             n_batches += 1
             global_step += 1
             
@@ -1412,6 +1488,7 @@ class CoVLATrainerPaper:
             'r2_loss': total_r2_loss / n_batches,
             'smoothing_loss': total_smooth_loss / n_batches,
             'distill_traj_loss': total_distill_traj / n_batches,
+            'distill_traj_feat_loss': total_distill_traj_feat / n_batches,
         }
     
     def _visualize_training_sample(self, batch, output, step):
@@ -1655,10 +1732,17 @@ class CoVLATrainerPaper:
         num_epochs: int = None,
     ):
         """Full training loop."""
-        if self.teacher is None and self.config.distill_traj_weight > 0:
-            raise ValueError(
-                "distill_traj_weight > 0 requires teacher=CoVLAAgentPaper(...) in CoVLATrainerPaper(...)"
-            )
+        w_traj, w_feat = self.config.distill_traj_weight, self.config.distill_traj_feat_weight
+        if w_traj > 0 or w_feat > 0:
+            errs = []
+            if self.teacher is None:
+                errs.append("Pass teacher=CoVLAAgentPaper(...) to CoVLATrainerPaper.")
+            if w_feat > 0 and self.config.distill_teacher_llm_dim is None:
+                errs.append("distill_traj_feat_weight > 0 requires distill_teacher_llm_dim (teacher LM hidden size).")
+            if w_feat > 0 and getattr(self.model, "traj_feat_projector", None) is None:
+                errs.append("Feature distillation requires student built with distill_traj_feat_weight > 0 and distill_teacher_llm_dim set.")
+            if errs:
+                raise ValueError("Distillation setup: " + " ".join(errs))
         
         num_epochs = num_epochs or self.config.num_epochs
         
@@ -1683,6 +1767,16 @@ class CoVLATrainerPaper:
             self.optimizer, T_max=num_epochs, eta_min=eta_min
         )
         
+        dist_parts = []
+        if self.config.distill_traj_weight > 0:
+            dist_parts.append(f"traj pred w={self.config.distill_traj_weight}")
+        if self.config.distill_traj_feat_weight > 0:
+            dist_parts.append(
+                f"traj-query hiddens w={self.config.distill_traj_feat_weight} "
+                f"(teacher_dim={self.config.distill_teacher_llm_dim})"
+            )
+        dist_line = "Distillation: " + ", ".join(dist_parts) if dist_parts else None
+        
         # Store training info for reprinting after clear_output
         self._training_info = [
             "",
@@ -1695,11 +1789,7 @@ class CoVLATrainerPaper:
             f"Batch size: {self.config.batch_size}",
             f"Learning rate: {self.config.learning_rate} → {self.config.learning_rate/3:.1e} (cosine decay)",
             f"Loss weights: caption={self.config.caption_weight}, trajectory={self.config.trajectory_weight}",
-            (
-                f"Distill: trajectory MSE vs frozen teacher, weight={self.config.distill_traj_weight}"
-                if self.config.distill_traj_weight > 0
-                else None
-            ),
+            dist_line,
             "=" * 70,
             "",
         ]
@@ -1708,7 +1798,8 @@ class CoVLATrainerPaper:
         for line in self._training_info:
             print(line)
         
-        header = f"{'Epoch':<6}{'Loss':<10}{'Traj':<10}{'Cap':<10}{'R2':<10}{'Smooth':<10}{'Val':<10}{'ADE':<8}{'FDE':<8}"
+        base = f"{'Epoch':<6}{'Loss':<10}{'Traj':<10}{'Cap':<10}{'R2':<10}{'Smooth':<10}"
+        header = base + self._distill_header_suffix() + f"{'Val':<10}{'ADE':<8}{'FDE':<8}"
         self._header = header
         print(header)
         print("-" * len(header))
@@ -1742,12 +1833,11 @@ class CoVLATrainerPaper:
                           f"{train_metrics['caption_loss']:<10.4f}"
                           f"{train_metrics['r2_loss']:<10.4f}"
                           f"{train_metrics['smoothing_loss']:<10.4f}"
+                          f"{self._distill_metrics_suffix(train_metrics)}"
                           f"{val_metrics['loss']:<10.4f}"
                           f"{val_metrics['ade']:<8.3f}{val_metrics['fde']:<8.3f}")
                 print(summary)
                 self._epoch_summaries.append(summary)
-                if self.config.distill_traj_weight > 0:
-                    print(f"      distill_traj: {train_metrics['distill_traj_loss']:.6f} (MSE vs teacher)")
                 # R2 (lead vehicle): precision & recall for "lead" class, dist_err when both have coords
                 if compute_r2:
                     r2_dist = val_metrics['r2_dist_mean']
@@ -1767,11 +1857,10 @@ class CoVLATrainerPaper:
                           f"{train_metrics['trajectory_loss']:<10.4f}"
                           f"{train_metrics['caption_loss']:<10.4f}"
                           f"{train_metrics['r2_loss']:<10.4f}"
-                          f"{train_metrics['smoothing_loss']:<10.4f}")
+                          f"{train_metrics['smoothing_loss']:<10.4f}"
+                          f"{self._distill_metrics_suffix(train_metrics)}")
                 print(summary)
                 self._epoch_summaries.append(summary)
-                if self.config.distill_traj_weight > 0:
-                    print(f"      distill_traj: {train_metrics['distill_traj_loss']:.6f} (MSE vs teacher)")
             
             # Save checkpoint each epoch
             self.model.save_trainable(f"covla_epoch_{epoch+1}.pt")
