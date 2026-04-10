@@ -30,8 +30,6 @@ from PIL import Image
 import numpy as np
 import json
 import os
-
-
 # =============================================================================
 # Navigation Commands (minimal set for VLA)
 # =============================================================================
@@ -247,6 +245,13 @@ class CoVLAConfig:
     # LoRA
     use_lora: bool = True
     lora_rank: int = 16
+    
+    # Diffusion trajectory head (optional; replaces deterministic TrajectoryMLP)
+    use_diffusion_trajectory: bool = False
+    diffusion_num_timesteps: int = 50
+    diffusion_hidden_dim: int = 256
+    diffusion_cond_dim: int = 256  # projected from LLM dim for the noise MLP
+    diffusion_traj_scale: float = 25.0  # divide coords by this before diffusion (rough meter scale)
     
     @property
     def vision_encoder(self) -> str:
@@ -608,6 +613,114 @@ class TrajectoryMLP(nn.Module):
         return self.mlp(x)  # (batch, num_points, coord_dim)
 
 
+def _extract_ddpm(a: torch.Tensor, t: torch.Tensor, x_shape: Tuple[int, ...]) -> torch.Tensor:
+    """Gather a[t] for each batch item and reshape to broadcast with x."""
+    b = t.shape[0]
+    out = a.gather(0, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+
+class TrajectoryDiffusionHead(nn.Module):
+    """
+    Minimal conditional DDPM on flattened trajectory (noise prediction).
+    Conditioning: pooled trajectory-query LLM states (mean over queries).
+    """
+
+    def __init__(
+        self,
+        cond_dim: int,
+        num_points: int,
+        coord_dim: int,
+        num_timesteps: int,
+        hidden_dim: int,
+        cond_proj_dim: int,
+        traj_scale: float,
+    ):
+        super().__init__()
+        self.num_points = num_points
+        self.coord_dim = coord_dim
+        self.flat_dim = num_points * coord_dim
+        self.num_timesteps = num_timesteps
+        self.traj_scale = traj_scale
+
+        betas = torch.linspace(1e-4, 0.02, num_timesteps)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alphas_cumprod", alphas_cumprod)
+        self.register_buffer("sqrt_acp", torch.sqrt(alphas_cumprod))
+        self.register_buffer("sqrt_one_minus_acp", torch.sqrt(1.0 - alphas_cumprod))
+        self.register_buffer("sqrt_recip_alphas", torch.sqrt(1.0 / alphas))
+        alphas_cumprod_prev = torch.cat([torch.ones(1), alphas_cumprod[:-1]])
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        self.register_buffer("posterior_variance", posterior_variance.clamp(min=1e-20))
+
+        te = 64
+        self.time_embed = nn.Embedding(num_timesteps, te)
+        self.cond_proj = nn.Linear(cond_dim, cond_proj_dim)
+        in_dim = self.flat_dim + cond_proj_dim + te
+        self.eps_net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.flat_dim),
+        )
+
+    def _predict_eps(self, x_flat: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """x_flat: (B, flat_dim), t: (B,) long, cond: (B, cond_dim)"""
+        te = self.time_embed(t)
+        c = self.cond_proj(cond)
+        h = torch.cat([x_flat, c, te], dim=-1)
+        return self.eps_net(h)
+
+    def training_loss_and_x0_hat(
+        self, x0_phys: torch.Tensor, cond: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        x0_phys: (B, P, 3) in dataset units.
+        Returns diffusion loss on noise, and x0_hat (B, P, 3) for metrics / smoothing.
+        """
+        device = x0_phys.device
+        B = x0_phys.shape[0]
+        x0 = (x0_phys.reshape(B, -1) / self.traj_scale).float()
+        t = torch.randint(0, self.num_timesteps, (B,), device=device, dtype=torch.long)
+        noise = torch.randn_like(x0)
+        sqrt_acp = _extract_ddpm(self.sqrt_acp, t, x0.shape)
+        sqrt_om = _extract_ddpm(self.sqrt_one_minus_acp, t, x0.shape)
+        x_t = sqrt_acp * x0 + sqrt_om * noise
+        eps_pred = self._predict_eps(x_t, t, cond.float())
+        loss = F.mse_loss(eps_pred, noise)
+        x0_hat = (x_t - sqrt_om * eps_pred) / (sqrt_acp + 1e-8)
+        x0_hat = x0_hat.view(B, self.num_points, self.coord_dim) * self.traj_scale
+        return loss, x0_hat
+
+    @torch.no_grad()
+    def sample(self, cond: torch.Tensor) -> torch.Tensor:
+        """DDPM reverse; cond: (B, cond_dim). Returns (B, P, 3) physical units."""
+        self.eval()
+        device = cond.device
+        B = cond.shape[0]
+        x = torch.randn(B, self.flat_dim, device=device, dtype=torch.float32)
+        cond_f = cond.float()
+        for ti in reversed(range(self.num_timesteps)):
+            t = torch.full((B,), ti, device=device, dtype=torch.long)
+            eps = self._predict_eps(x, t, cond_f)
+            beta_t = _extract_ddpm(self.betas, t, x.shape)
+            sqrt_om_ab = _extract_ddpm(self.sqrt_one_minus_acp, t, x.shape)
+            sr = _extract_ddpm(self.sqrt_recip_alphas, t, x.shape)
+            mean = sr * (x - beta_t / sqrt_om_ab * eps)
+            if ti > 0:
+                noise = torch.randn_like(x)
+                var = _extract_ddpm(self.posterior_variance, t, x.shape)
+                x = mean + torch.sqrt(var) * noise
+            else:
+                x = mean
+        x = x.view(B, self.num_points, self.coord_dim) * self.traj_scale
+        return x
+
+
 # =============================================================================
 # CoVLA-Agent (exact paper architecture)
 # =============================================================================
@@ -706,12 +819,26 @@ class CoVLAAgentPaper(nn.Module):
         self.num_frames = config.num_history_frames + 1  # e.g., 3 frames for 2 history
         # Concat fusion: no extra params needed - just concatenate all frame tokens
         
-        # Trajectory MLP (paper specification)
-        self.trajectory_mlp = TrajectoryMLP(
-            input_dim=self.llm_dim,
-            num_points=config.trajectory_points,
-            coord_dim=config.trajectory_dim,
-        )
+        # Trajectory head: paper MLP, or optional conditional DDPM on flattened path
+        self.use_diffusion_trajectory = config.use_diffusion_trajectory
+        if self.use_diffusion_trajectory:
+            self.traj_diffusion = TrajectoryDiffusionHead(
+                cond_dim=self.llm_dim,
+                num_points=config.trajectory_points,
+                coord_dim=config.trajectory_dim,
+                num_timesteps=config.diffusion_num_timesteps,
+                hidden_dim=config.diffusion_hidden_dim,
+                cond_proj_dim=config.diffusion_cond_dim,
+                traj_scale=config.diffusion_traj_scale,
+            )
+            self.trajectory_mlp = None
+        else:
+            self.traj_diffusion = None
+            self.trajectory_mlp = TrajectoryMLP(
+                input_dim=self.llm_dim,
+                num_points=config.trajectory_points,
+                coord_dim=config.trajectory_dim,
+            )
         
         # Optional projector for trajectory-query feature distillation (student hidden -> teacher hidden size)
         self.traj_feat_projector: Optional[nn.Linear] = None
@@ -735,6 +862,13 @@ class CoVLAAgentPaper(nn.Module):
         print(f"  Ego state: {'extended (vEgo, aEgo, steering)' if config.use_extended_ego_state else 'speed only'}")
         print(f"  Nav command: {'enabled (LEFT/RIGHT/STRAIGHT)' if config.use_nav_cmd else 'disabled'}")
         print(f"  Temporal: {self.num_frames} frames (concat)")
+        if self.use_diffusion_trajectory:
+            print(
+                f"  Trajectory: diffusion DDPM (T={config.diffusion_num_timesteps}, "
+                f"scale={config.diffusion_traj_scale})"
+            )
+        else:
+            print("  Trajectory: MLP (paper)")
         print(f"  Total params: {total:,}")
         print(f"  Trainable: {trainable:,}")
     
@@ -762,15 +896,18 @@ class CoVLAAgentPaper(nn.Module):
         Save only trainable components (efficient - ~50MB instead of ~5GB).
         
         Saves: LoRA adapters, vision_projection, speed_embedding, 
-               trajectory_queries, trajectory_mlp
+               trajectory_queries, trajectory_mlp or traj_diffusion
         """
         trainable_state = {
             'vision_projection': self.vision_projection.state_dict(),
             'speed_embedding': self.speed_embedding.state_dict(),
             'trajectory_queries': self.trajectory_queries.data,
-            'trajectory_mlp': self.trajectory_mlp.state_dict(),
             'config': self.config,
         }
+        if self.use_diffusion_trajectory:
+            trainable_state['traj_diffusion'] = self.traj_diffusion.state_dict()
+        else:
+            trainable_state['trajectory_mlp'] = self.trajectory_mlp.state_dict()
         
         if self.traj_feat_projector is not None:
             trainable_state['traj_feat_projector'] = self.traj_feat_projector.state_dict()
@@ -803,7 +940,15 @@ class CoVLAAgentPaper(nn.Module):
         self.vision_projection.load_state_dict(checkpoint['vision_projection'])
         self.speed_embedding.load_state_dict(checkpoint['speed_embedding'])
         self.trajectory_queries.data = checkpoint['trajectory_queries'].to(self.config.device)
-        self.trajectory_mlp.load_state_dict(checkpoint['trajectory_mlp'])
+        if self.use_diffusion_trajectory:
+            if 'traj_diffusion' not in checkpoint:
+                raise ValueError(
+                    "Checkpoint has no traj_diffusion. Use a checkpoint trained with "
+                    "use_diffusion_trajectory=True, or set use_diffusion_trajectory=False for MLP ckpts."
+                )
+            self.traj_diffusion.load_state_dict(checkpoint['traj_diffusion'])
+        else:
+            self.trajectory_mlp.load_state_dict(checkpoint['trajectory_mlp'])
         
         if 'traj_feat_projector' in checkpoint and self.traj_feat_projector is not None:
             self.traj_feat_projector.load_state_dict(checkpoint['traj_feat_projector'])
@@ -1011,8 +1156,20 @@ class CoVLAAgentPaper(nn.Module):
         # Extract trajectory query outputs (last 10 tokens as per Figure 5)
         traj_query_outputs = hidden_states[:, -self.num_trajectory_queries:, :]  # (batch, 10, llm_dim)
         
-        # Predict trajectory from each query token (paper: MLP on trajectory queries)
-        pred_trajectory = self.trajectory_mlp(traj_query_outputs.float())  # (batch, 10, 3)
+        traj_q = traj_query_outputs.float()
+        trajectory_loss = None
+        if self.use_diffusion_trajectory:
+            cond = traj_q.mean(dim=1)  # (batch, llm_dim)
+            if trajectories is not None:
+                trajectory_loss, pred_trajectory = self.traj_diffusion.training_loss_and_x0_hat(
+                    trajectories, cond
+                )
+            else:
+                pred_trajectory = self.traj_diffusion.sample(cond)
+        else:
+            pred_trajectory = self.trajectory_mlp(traj_q)
+            if trajectories is not None:
+                trajectory_loss = F.mse_loss(pred_trajectory, trajectories)
         
         result = {
             'pred_trajectory': pred_trajectory,
@@ -1022,8 +1179,7 @@ class CoVLAAgentPaper(nn.Module):
         
         # Calculate losses if training (trajectories provided)
         if trajectories is not None:
-            # Task 2: Trajectory Prediction (MSE loss)
-            trajectory_loss = F.mse_loss(pred_trajectory, trajectories)
+            # Task 2: Trajectory — MSE (MLP) or noise prediction (diffusion)
             result['trajectory_loss'] = trajectory_loss
             
             # Smoothing loss: L2 penalty on acceleration (standard in trajectory prediction)
