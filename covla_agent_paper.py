@@ -252,6 +252,9 @@ class CoVLAConfig:
     diffusion_hidden_dim: int = 256
     diffusion_cond_dim: int = 256  # projected from LLM dim for the noise MLP
     diffusion_traj_scale: float = 25.0  # divide coords by this before diffusion (rough meter scale)
+    diffusion_loss_bins: int = 5  # log noise MSE averaged over t bins (train)
+    diffusion_eval_num_samples: int = 8  # default K for eval image fan (set generate_eval_images diffusion_fan_k)
+    diffusion_viz_num_samples: int = 1  # training viz (diffusion): N independent sample() curves + always Pred(x0_hat); N=0 → x0_hat only
     
     @property
     def vision_encoder(self) -> str:
@@ -692,9 +695,10 @@ class TrajectoryDiffusionHead(nn.Module):
         x_t = sqrt_acp * x0 + sqrt_om * noise
         eps_pred = self._predict_eps(x_t, t, cond.float())
         loss = F.mse_loss(eps_pred, noise)
+        mse_per = ((eps_pred - noise) ** 2).mean(dim=1).detach()  # (B,) for bin logging
         x0_hat = (x_t - sqrt_om * eps_pred) / (sqrt_acp + 1e-8)
         x0_hat = x0_hat.view(B, self.num_points, self.coord_dim) * self.traj_scale
-        return loss, x0_hat
+        return loss, x0_hat, t, mse_per
 
     @torch.no_grad()
     def sample(self, cond: torch.Tensor) -> torch.Tensor:
@@ -1160,10 +1164,13 @@ class CoVLAAgentPaper(nn.Module):
         trajectory_loss = None
         if self.use_diffusion_trajectory:
             cond = traj_q.mean(dim=1)  # (batch, llm_dim)
+            result_diffusion = {'diffusion_cond': cond}
             if trajectories is not None:
-                trajectory_loss, pred_trajectory = self.traj_diffusion.training_loss_and_x0_hat(
-                    trajectories, cond
+                trajectory_loss, pred_trajectory, t_b, mse_per = (
+                    self.traj_diffusion.training_loss_and_x0_hat(trajectories, cond)
                 )
+                result_diffusion['diffusion_t'] = t_b.detach()
+                result_diffusion['diffusion_mse_per'] = mse_per
             else:
                 pred_trajectory = self.traj_diffusion.sample(cond)
         else:
@@ -1176,6 +1183,8 @@ class CoVLAAgentPaper(nn.Module):
             'hidden_states': hidden_states,
             'traj_query_outputs': traj_query_outputs,
         }
+        if self.use_diffusion_trajectory:
+            result.update(result_diffusion)
         
         # Calculate losses if training (trajectories provided)
         if trajectories is not None:
@@ -1371,10 +1380,13 @@ class CoVLAAgentPaper(nn.Module):
         output = self.forward(images, captions=[caption_for_trajectory], ego_state=ego_state, nav_cmd_idx=nav_cmd_idx)
         trajectory = output['pred_trajectory'][0].cpu().numpy()
         
-        return {
+        out = {
             'trajectory': trajectory,
             'caption': caption_for_trajectory,
         }
+        if self.use_diffusion_trajectory and output.get('diffusion_cond') is not None:
+            out['diffusion_cond'] = output['diffusion_cond']
+        return out
 
 
 # =============================================================================
@@ -1566,6 +1578,9 @@ class CoVLATrainerPaper:
         n_batches = 0
         global_step = getattr(self, '_global_step', -1)
         accum_steps = self.config.gradient_accumulation_steps
+        num_bins = self.config.diffusion_loss_bins
+        diff_bin_sum = [0.0] * num_bins
+        diff_bin_cnt = [0] * num_bins
         
         for batch_idx, batch in enumerate(dataloader):
             images = batch['images'].to(self.device)  # (B, num_frames, C, H, W)
@@ -1631,11 +1646,27 @@ class CoVLATrainerPaper:
             n_batches += 1
             global_step += 1
             
+            if output.get('diffusion_t') is not None:
+                t_b = output['diffusion_t']
+                mse_b = output['diffusion_mse_per']
+                Tn = self.model.traj_diffusion.num_timesteps
+                bin_idx = (t_b.float() * num_bins / Tn).long().clamp(0, num_bins - 1)
+                for bi in range(num_bins):
+                    m = bin_idx == bi
+                    if m.any():
+                        diff_bin_sum[bi] += mse_b[m].sum().item()
+                        diff_bin_cnt[bi] += int(m.sum().item())
+            
             # Visualize every 500 steps
             if global_step % 250 == 0:
                 self._visualize_training_sample(batch, output, global_step)
         
         self._global_step = global_step
+        
+        diffusion_bin_mse = [
+            diff_bin_sum[i] / diff_bin_cnt[i] if diff_bin_cnt[i] else float('nan')
+            for i in range(num_bins)
+        ]
         
         return {
             'loss': total_loss / n_batches,
@@ -1645,6 +1676,7 @@ class CoVLATrainerPaper:
             'smoothing_loss': total_smooth_loss / n_batches,
             'distill_traj_loss': total_distill_traj / n_batches,
             'distill_traj_feat_loss': total_distill_traj_feat / n_batches,
+            'diffusion_bin_mse': diffusion_bin_mse,
         }
     
     def _visualize_training_sample(self, batch, output, step):
@@ -1683,15 +1715,29 @@ class CoVLATrainerPaper:
         
         # Re-compute prediction in eval mode (training output has dropout noise)
         images_input = batch['images'][0:1].to(self.device)  # (1, num_frames, C, H, W)
+        gt_tensor = batch['trajectory'][0:1].to(self.device)
         
+        # With GT in forward: same as val — diffusion uses x0_hat (noise estimate), not full sample().
+        # Without GT, diffusion would plot pure sample() which is often chaotic until sampling is well trained.
         with torch.no_grad():
             eval_output = self.model(
                 images_input,
                 captions=[batch['caption'][0]],
+                trajectories=gt_tensor,
                 ego_state=batch['ego_state'][0:1].to(self.device),
                 nav_cmd_idx=nav_cmd_idx,
             )
         pred_traj = eval_output['pred_trajectory'][0].cpu().numpy()
+        # Diffusion: optional extra full sample() curves (same cond); Pred(x0_hat) is always above
+        sample_trajs = []
+        if self.model.config.use_diffusion_trajectory:
+            cmap = plt.cm.tab10
+            dc = eval_output["diffusion_cond"]
+            n_s = max(0, int(self.model.config.diffusion_viz_num_samples))
+            for _ in range(n_s):
+                sample_trajs.append(self.model.traj_diffusion.sample(dc).cpu().numpy()[0])
+        else:
+            cmap = None
         caption = batch['caption'][0] if isinstance(batch['caption'], list) else batch['caption']
         
         teacher_traj = None
@@ -1722,9 +1768,14 @@ class CoVLATrainerPaper:
         first_frame = np.array(Image.open(first_path).convert('RGB'))
         last_frame = np.array(Image.open(last_path).convert('RGB'))
         
-        # Compute metrics
+        # Metrics: val-aligned on x0_hat; optional sample ADE (first sample curve)
         ade = np.mean(np.linalg.norm(pred_traj - gt_traj, axis=1))
         fde = np.linalg.norm(pred_traj[-1] - gt_traj[-1])
+        ade_s = (
+            np.mean(np.linalg.norm(sample_trajs[0] - gt_traj, axis=1))
+            if sample_trajs
+            else None
+        )
         
         # Generate predicted caption (uses all frames)
         with torch.no_grad():
@@ -1746,20 +1797,33 @@ class CoVLATrainerPaper:
         
         # Middle: Current frame with trajectory
         ax2 = axes[1]
-        plot_trajectory_on_image(last_frame, gt_traj, extrinsic, intrinsic, color='green', label='GT', ax=ax2)
-        plot_trajectory_on_image(last_frame, pred_traj, extrinsic, intrinsic, color='red', label='Pred', ax=ax2)
+        plot_trajectory_on_image(last_frame, gt_traj, extrinsic, intrinsic, color='green', label='GT', ax=ax2, imshow_frame=True)
+        pred_lbl = "Pred (x0_hat)" if self.model.config.use_diffusion_trajectory else "Pred"
+        plot_trajectory_on_image(last_frame, pred_traj, extrinsic, intrinsic, color='red', label=pred_lbl, ax=ax2, imshow_frame=False)
+        if sample_trajs:
+            plot_trajectory_on_image(
+                last_frame, sample_trajs[0], extrinsic, intrinsic,
+                color='magenta', linestyle='--', label='Pred (sample)', ax=ax2, imshow_frame=False,
+            )
+            for j, st in enumerate(sample_trajs[1:], start=1):
+                plot_trajectory_on_image(
+                    last_frame, st, extrinsic, intrinsic,
+                    color=cmap((j % 10) / 9.0), label=(f"sample+{j}" if j <= 2 else None),
+                    ax=ax2, imshow_frame=False,
+                )
         if teacher_traj is not None:
             plot_trajectory_on_image(
-                last_frame, teacher_traj, extrinsic, intrinsic, color='darkorange', label='Teacher', ax=ax2
+                last_frame, teacher_traj, extrinsic, intrinsic, color='darkorange', label='Teacher', ax=ax2, imshow_frame=False
             )
-        plot_trajectory_on_image(last_frame, traj_physics, extrinsic, intrinsic, color='blue', label='Physics', ax=ax2)
+        plot_trajectory_on_image(last_frame, traj_physics, extrinsic, intrinsic, color='blue', label='Physics', ax=ax2, imshow_frame=False)
         ax2.legend(loc='upper right')
-        ax2.set_title(f"Current Frame | Nav: {nav_cmd} | ADE: {ade:.2f}m | FDE: {fde:.2f}m | {ego['vEgo']:.1f} m/s")
+        samp_note = f" | ADE_s {ade_s:.2f}m" if ade_s is not None else ""
+        ax2.set_title(f"Current Frame | Nav: {nav_cmd} | ADE {ade:.2f}m | FDE {fde:.2f}m | {ego['vEgo']:.1f} m/s{samp_note}")
         
         # Right: Bird's eye view
         ax3 = axes[2]
         ax3.plot(gt_traj[:, 0], gt_traj[:, 1], 'g-o', markersize=5, label='GT')
-        ax3.plot(pred_traj[:, 0], pred_traj[:, 1], 'r-o', markersize=5, label='Pred')
+        ax3.plot(pred_traj[:, 0], pred_traj[:, 1], 'r-o', markersize=5, label=pred_lbl)
         if teacher_traj is not None:
             ax3.plot(
                 teacher_traj[:, 0],
@@ -1772,13 +1836,18 @@ class CoVLATrainerPaper:
             )
         ax3.plot(traj_physics[:, 0], traj_physics[:, 1], 'b-s', markersize=4, 
                  label='Physics', alpha=0.7, linewidth=1.5)
+        if sample_trajs:
+            ax3.plot(sample_trajs[0][:, 0], sample_trajs[0][:, 1], '--', color='magenta', linewidth=2, markersize=4, label='Pred (sample)')
+            for j, st in enumerate(sample_trajs[1:], start=1):
+                ax3.plot(st[:, 0], st[:, 1], '-', color=cmap((j % 10) / 9.0), linewidth=1.2, alpha=0.85)
         ax3.scatter([0], [0], c='blue', s=100, marker='*', label='Ego', zorder=5)
         ax3.set_xlabel('Forward (m)')
         ax3.set_ylabel('Lateral (m)')
         ax3.legend()
         ax3.grid(True, alpha=0.3)
         ax3.set_aspect('equal')
-        ax3.set_title("Bird's Eye View")
+        bev_note = f" | +{len(sample_trajs)} sample()" if sample_trajs else ""
+        ax3.set_title(f"Bird's Eye View{bev_note}")
         
         plt.suptitle(f"Step {step}", fontsize=12, fontweight='bold')
         plt.tight_layout()
@@ -2003,6 +2072,11 @@ class CoVLATrainerPaper:
                           f"({val_metrics['r2_n_correct_lead']}/{val_metrics['r2_n_lead']} lead detected)")
                 else:
                     print(f"      R2: (skipped — runs from epoch {self.config.eval_r2_from_epoch}+ and on final epoch)")
+                if self.config.use_diffusion_trajectory:
+                    bm = train_metrics.get('diffusion_bin_mse', [])
+                    if bm:
+                        parts = [f"{x:.4f}" if x == x else "nan" for x in bm]
+                        print(f"      diff ε-MSE by t-bin (low t → high t): [{', '.join(parts)}]")
                 
                 # Save best model
                 if val_metrics['ade'] < best_ade:
@@ -2017,6 +2091,11 @@ class CoVLATrainerPaper:
                           f"{self._distill_metrics_suffix(train_metrics)}")
                 print(summary)
                 self._epoch_summaries.append(summary)
+                if self.config.use_diffusion_trajectory:
+                    bm = train_metrics.get('diffusion_bin_mse', [])
+                    if bm:
+                        parts = [f"{x:.4f}" if x == x else "nan" for x in bm]
+                        print(f"      diff ε-MSE by t-bin (low t → high t): [{', '.join(parts)}]")
             
             # Save checkpoint each epoch
             self.model.save_trainable(f"covla_epoch_{epoch+1}.pt")
@@ -2088,6 +2167,8 @@ def plot_trajectory_on_image(
     color: str = "red",
     label: str = "Trajectory",
     ax=None,
+    imshow_frame: bool = True,
+    linestyle: str = "-",
 ):
     """
     Plot trajectory on image (following tutorial.ipynb style).
@@ -2100,6 +2181,8 @@ def plot_trajectory_on_image(
         color: Trajectory color
         label: Legend label
         ax: Matplotlib axis (creates new if None)
+        imshow_frame: If False, skip ax.imshow (overlay more curves on same axes)
+        linestyle: Matplotlib line style for the polyline
     """
     import matplotlib.pyplot as plt
     
@@ -2118,7 +2201,8 @@ def plot_trajectory_on_image(
     traj_camera = traj_camera[valid_mask]
     
     if len(traj_camera) == 0:
-        ax.imshow(frame)
+        if imshow_frame:
+            ax.imshow(frame)
         ax.set_title("No trajectory points visible")
         ax.axis('off')
         return ax
@@ -2135,10 +2219,11 @@ def plot_trajectory_on_image(
     traj_image = traj_image[valid_mask]
     
     # Plot
-    ax.imshow(frame)
+    if imshow_frame:
+        ax.imshow(frame)
     if len(traj_image) > 0:
         ax.plot(traj_image[:, 0], traj_image[:, 1], 
-               marker='o', color=color, linestyle='-', 
+               marker='o', color=color, linestyle=linestyle, 
                linewidth=3, markersize=8, alpha=0.9, label=label)
     ax.axis('off')
     
@@ -2499,21 +2584,46 @@ def _predict_sample(model, sample, caption_mode="pred", debug=False):
         'pred_caption': pred_caption,
         'ade': ade,
         'fde': fde,
+        'diffusion_cond': result.get('diffusion_cond'),
     }
 
 
-def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
+def visualize(
+    model,
+    dataset,
+    idx: int = 0,
+    caption_mode: str = "pred",
+    diffusion_fan_k: Optional[int] = None,
+):
     """
     Visualize model prediction on a dataset sample (matplotlib).
+    
+    With ``use_diffusion_trajectory``, optional K extra DDPM samples (fan) on camera + BEV.
+    ``diffusion_fan_k=None`` uses ``config.diffusion_eval_num_samples``; set ``0`` to disable.
     
     Usage:
         visualize(model, val_dataset, idx=0)
         visualize(model, val_dataset, idx=10, caption_mode="gt")
+        visualize(model, val_dataset, idx=0, diffusion_fan_k=8)
     """
     import matplotlib.pyplot as plt
     
     sample = dataset[idx]
     r = _predict_sample(model, sample, caption_mode)
+    
+    use_d = getattr(model.config, "use_diffusion_trajectory", False)
+    if diffusion_fan_k is None:
+        k_fan = getattr(model.config, "diffusion_eval_num_samples", 8) if use_d else 0
+    else:
+        k_fan = int(diffusion_fan_k) if use_d else 0
+    
+    fan_trajs = []
+    if k_fan > 0 and r.get("diffusion_cond") is not None and getattr(model, "traj_diffusion", None) is not None:
+        dc = r["diffusion_cond"]
+        with torch.no_grad():
+            for _ in range(k_fan):
+                fan_trajs.append(model.traj_diffusion.sample(dc).cpu().numpy()[0])
+    cmap = plt.cm.tab10
     
     # Get physics trajectory from prediction result
     traj_physics = r.get('trajectory_physics')  # (10, 3) or None
@@ -2534,17 +2644,25 @@ def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
     # Middle: Current frame with trajectories
     ax2 = axes[1]
     plot_trajectory_on_image(r['last_frame'], r['gt_traj'], r['extrinsic'], r['intrinsic'], 
-                             color='green', label='GT', ax=ax2)
+                             color='green', label='GT', ax=ax2, imshow_frame=True)
     plot_trajectory_on_image(r['last_frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
-                             color='red', label='Pred', ax=ax2)
+                             color='red', label='Pred', ax=ax2, imshow_frame=False)
     
     # Plot physics trajectory on image if available
     if traj_physics is not None:
         plot_trajectory_on_image(r['last_frame'], traj_physics, r['extrinsic'], r['intrinsic'], 
-                                 color='blue', label='Physics', ax=ax2)
+                                 color='blue', label='Physics', ax=ax2, imshow_frame=False)
+    
+    for j, ft in enumerate(fan_trajs):
+        plot_trajectory_on_image(
+            r['last_frame'], ft, r['extrinsic'], r['intrinsic'],
+            color=cmap((j % 10) / 9.0), label=(f"s{j}" if j < 4 else None),
+            ax=ax2, imshow_frame=False,
+        )
     
     ax2.legend(loc='upper right')
-    ax2.set_title(f"Current Frame | Nav: {nav_cmd} | ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | {ego['vEgo']:.1f} m/s")
+    fan_note = f" | fan K={len(fan_trajs)}" if fan_trajs else ""
+    ax2.set_title(f"Current Frame | Nav: {nav_cmd} | ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | {ego['vEgo']:.1f} m/s{fan_note}")
     
     # Right: Bird's eye view
     ax3 = axes[2]
@@ -2556,13 +2674,17 @@ def visualize(model, dataset, idx: int = 0, caption_mode: str = "pred"):
         ax3.plot(traj_physics[:, 0], traj_physics[:, 1], 'b-s', markersize=4, 
                  label='Physics (IMU)', alpha=0.7, linewidth=1.5)
     
+    for j, ft in enumerate(fan_trajs):
+        ax3.plot(ft[:, 0], ft[:, 1], '-', color=cmap((j % 10) / 9.0), linewidth=1.2, alpha=0.85)
+    
     ax3.scatter([0], [0], c='blue', s=100, marker='*', label='Ego', zorder=5)
     ax3.set_xlabel('Forward (m)')
     ax3.set_ylabel('Lateral (m)')
     ax3.legend()
     ax3.grid(True, alpha=0.3)
     ax3.set_aspect('equal')
-    ax3.set_title("Bird's Eye View")
+    bev_note = f" +{len(fan_trajs)} samples" if fan_trajs else ""
+    ax3.set_title(f"Bird's Eye View{bev_note}")
     
     plt.tight_layout()
     plt.show()
@@ -2585,6 +2707,7 @@ def generate_eval_images(
     show_gt: bool = True,
     generate_video: bool = True,
     fps: int = 3,
+    diffusion_fan_k: Optional[int] = None,
 ):
     """
     Generate evaluation images with trajectory overlay + bird's eye view + captions.
@@ -2604,6 +2727,13 @@ def generate_eval_images(
     print(f"🖼️ Generating {end_idx - start_idx} images → {output_dir}/")
     model.eval()
     
+    use_d = getattr(model.config, "use_diffusion_trajectory", False)
+    if diffusion_fan_k is None:
+        k_fan = getattr(model.config, "diffusion_eval_num_samples", 8) if use_d else 0
+    else:
+        k_fan = int(diffusion_fan_k) if use_d else 0
+    
+    cmap = plt.cm.tab10
     metrics = []
     saved_images = []
     
@@ -2611,6 +2741,13 @@ def generate_eval_images(
         sample = dataset[i]
         r = _predict_sample(model, sample, caption_mode)
         metrics.append({'ade': r['ade'], 'fde': r['fde']})
+        
+        fan_trajs = []
+        if k_fan > 0 and r.get("diffusion_cond") is not None and getattr(model, "traj_diffusion", None) is not None:
+            dc = r["diffusion_cond"]
+            with torch.no_grad():
+                for _ in range(k_fan):
+                    fan_trajs.append(model.traj_diffusion.sample(dc).cpu().numpy()[0])
         
         # Get GT caption from sample
         gt_caption = sample.get('caption', 'N/A')
@@ -2631,23 +2768,33 @@ def generate_eval_images(
         # Middle: Current frame with trajectory overlay
         ax2 = axes[1]
         plot_trajectory_on_image(r['last_frame'], r['gt_traj'], r['extrinsic'], r['intrinsic'], 
-                                 color='green', label='GT', ax=ax2)
+                                 color='green', label='GT', ax=ax2, imshow_frame=True)
         plot_trajectory_on_image(r['last_frame'], r['pred_traj'], r['extrinsic'], r['intrinsic'], 
-                                 color='red', label='Pred', ax=ax2)
+                                 color='red', label='Pred', ax=ax2, imshow_frame=False)
+        for j, ft in enumerate(fan_trajs):
+            plot_trajectory_on_image(
+                r['last_frame'], ft, r['extrinsic'], r['intrinsic'],
+                color=cmap((j % 10) / 9.0), label=(f"s{j}" if j < 4 else None),
+                ax=ax2, imshow_frame=False,
+            )
         ax2.legend(loc='upper right')
-        ax2.set_title(f"Frame {i} | Nav: {nav_cmd} | ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | {ego['vEgo']:.1f} m/s")
+        fan_note = f" | fan K={len(fan_trajs)}" if fan_trajs else ""
+        ax2.set_title(f"Frame {i} | Nav: {nav_cmd} | ADE: {r['ade']:.2f}m | FDE: {r['fde']:.2f}m | {ego['vEgo']:.1f} m/s{fan_note}")
         
         # Right: Bird's eye view
         ax3 = axes[2]
         ax3.plot(r['gt_traj'][:, 0], r['gt_traj'][:, 1], 'g-o', markersize=6, linewidth=2, label='GT')
         ax3.plot(r['pred_traj'][:, 0], r['pred_traj'][:, 1], 'r-o', markersize=6, linewidth=2, label='Pred')
+        for j, ft in enumerate(fan_trajs):
+            ax3.plot(ft[:, 0], ft[:, 1], '-', color=cmap((j % 10) / 9.0), linewidth=1.2, alpha=0.85)
         ax3.scatter([0], [0], c='blue', s=150, marker='*', label='Ego', zorder=5)
         ax3.set_xlabel('Forward (m)')
         ax3.set_ylabel('Lateral (m)')
         ax3.legend(loc='upper right')
         ax3.grid(True, alpha=0.3)
         ax3.set_aspect('equal')
-        ax3.set_title("Bird's Eye View")
+        bev_note = f" +{len(fan_trajs)} samples" if fan_trajs else ""
+        ax3.set_title(f"Bird's Eye View{bev_note}")
         
         plt.tight_layout()
         
