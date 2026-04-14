@@ -255,6 +255,13 @@ class CoVLAConfig:
     diffusion_loss_bins: int = 5  # log noise MSE averaged over t bins (train)
     diffusion_eval_num_samples: int = 8  # default K for eval image fan (set generate_eval_images diffusion_fan_k)
     diffusion_viz_num_samples: int = 1  # training viz (diffusion): N independent sample() curves + always Pred(x0_hat); N=0 → x0_hat only
+    # Extra MSE(pred_trajectory, GT) inside trajectory_loss when using diffusion; pred is x0_hat from random t.
+    # Default 0 = noise-only (hard to "overfit" paths like MLP). Try 0.5–2.0 when you want direct path fit / overfit debug.
+    diffusion_aux_x0_weight: float = 0.0
+    # traj_diffusion LR = learning_rate * this (1.0 = same as rest). With learning_rate ~2e-5, try 5–10 first.
+    diffusion_lr_multiplier: float = 1.0
+    # If True, print example 0 every 100 optimizer steps (uses model.global_step; interval hardcoded in head).
+    diffusion_debug_forward: bool = False
     
     @property
     def vision_encoder(self) -> str:
@@ -679,11 +686,15 @@ class TrajectoryDiffusionHead(nn.Module):
         return self.eps_net(h)
 
     def training_loss_and_x0_hat(
-        self, x0_phys: torch.Tensor, cond: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self,
+        x0_phys: torch.Tensor,
+        cond: torch.Tensor,
+        debug_forward: bool = False,
+        train_step: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         x0_phys: (B, P, 3) in dataset units.
-        Returns diffusion loss on noise, and x0_hat (B, P, 3) for metrics / smoothing.
+        Returns (loss, x0_hat, t, mse_per) — diffusion loss on noise, and x0_hat (B, P, 3) for metrics.
         """
         device = x0_phys.device
         B = x0_phys.shape[0]
@@ -694,10 +705,53 @@ class TrajectoryDiffusionHead(nn.Module):
         sqrt_om = _extract_ddpm(self.sqrt_one_minus_acp, t, x0.shape)
         x_t = sqrt_acp * x0 + sqrt_om * noise
         eps_pred = self._predict_eps(x_t, t, cond.float())
+        x0_hat_flat = (x_t - sqrt_om * eps_pred) / (sqrt_acp + 1e-8)
+
+        _DBG_EVERY = 100
+        if debug_forward and train_step is not None and train_step % _DBG_EVERY == 0:
+            i = 0  # one example in the batch
+            ti = t[i].item()
+            sa_i = sqrt_acp[i, 0].item()
+            so_i = sqrt_om[i, 0].item()
+            x0_i, ni, xt_i = x0[i], noise[i], x_t[i]
+            ep_i, xh_i = eps_pred[i], x0_hat_flat[i]
+
+            # Waypoints 0, 3, 6, 9 (every 3 indices, up to 10 points)
+            def _wp_rows_stride(flat: torch.Tensor) -> str:
+                m = flat.view(self.num_points, self.coord_dim).detach().cpu().numpy()
+                n = min(self.num_points, 10)
+                lines = []
+                for wp in range(0, n, 3):
+                    lines.append(
+                        f"    wp{wp}: [{m[wp, 0]: .5f}, {m[wp, 1]: .5f}, {m[wp, 2]: .5f}]"
+                    )
+                return "\n".join(lines)
+
+            print(
+                f"[diffusion] global_step={train_step} example=0 t={ti} | "
+                f"sqrt_acp={sa_i:.6f} sqrt_om={so_i:.6f}"
+            )
+            print("  x0(norm) waypoints 0,3,6,9 (x, y, z):")
+            print(_wp_rows_stride(x0[i]))
+            print("  noise (same indices):")
+            print(_wp_rows_stride(noise[i]))
+            print("  x_t:")
+            print(_wp_rows_stride(x_t[i]))
+            print("  eps_pred:")
+            print(_wp_rows_stride(eps_pred[i]))
+            print("  x0_hat(norm) from ε_pred (same scale as x0):")
+            print(_wp_rows_stride(x0_hat_flat[i]))
+            print(
+                f"  flat stats — x0 μ/σ/min/max={x0_i.mean().item():.4f}/{x0_i.std().item():.4f}/"
+                f"{x0_i.min().item():.4f}/{x0_i.max().item():.4f} | "
+                f"noise μ/σ={ni.mean().item():.4f}/{ni.std().item():.4f} | "
+                f"x_t μ/σ={xt_i.mean().item():.4f}/{xt_i.std().item():.4f} | "
+                f"eps_pred μ/σ={ep_i.mean().item():.4f}/{ep_i.std().item():.4f} | "
+                f"x0_hat(norm) μ/σ={xh_i.mean().item():.4f}/{xh_i.std().item():.4f}"
+            )
         loss = F.mse_loss(eps_pred, noise)
         mse_per = ((eps_pred - noise) ** 2).mean(dim=1).detach()  # (B,) for bin logging
-        x0_hat = (x_t - sqrt_om * eps_pred) / (sqrt_acp + 1e-8)
-        x0_hat = x0_hat.view(B, self.num_points, self.coord_dim) * self.traj_scale
+        x0_hat = x0_hat_flat.view(B, self.num_points, self.coord_dim) * self.traj_scale
         return loss, x0_hat, t, mse_per
 
     @torch.no_grad()
@@ -747,6 +801,7 @@ class CoVLAAgentPaper(nn.Module):
     def __init__(self, config: CoVLAConfig):
         super().__init__()
         self.config = config
+        self.global_step = 0  # training forwards with trajectories; used for diffusion_debug_forward
         
         # Vision Encoder
         print("Loading Vision Encoder...")
@@ -1167,8 +1222,17 @@ class CoVLAAgentPaper(nn.Module):
             result_diffusion = {'diffusion_cond': cond}
             if trajectories is not None:
                 trajectory_loss, pred_trajectory, t_b, mse_per = (
-                    self.traj_diffusion.training_loss_and_x0_hat(trajectories, cond)
+                    self.traj_diffusion.training_loss_and_x0_hat(
+                        trajectories,
+                        cond,
+                        debug_forward=self.config.diffusion_debug_forward and self.training,
+                        train_step=self.global_step if self.training else None,
+                    )
                 )
+                if self.config.diffusion_aux_x0_weight > 0:
+                    trajectory_loss = trajectory_loss + self.config.diffusion_aux_x0_weight * F.mse_loss(
+                        pred_trajectory, trajectories
+                    )
                 result_diffusion['diffusion_t'] = t_b.detach()
                 result_diffusion['diffusion_mse_per'] = mse_per
             else:
@@ -1238,6 +1302,9 @@ class CoVLAAgentPaper(nn.Module):
             loss = loss + self.config.caption_r2_weight * r2_loss
             result['r2_loss'] = r2_loss
             result['loss'] = loss
+        
+        if self.training and trajectories is not None:
+            self.global_step += 1
         
         return result
     
@@ -1462,9 +1529,27 @@ class CoVLATrainerPaper:
             for p in self.teacher.parameters():
                 p.requires_grad = False
         
-        # Optimizer
-        trainable = [p for p in model.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.AdamW(trainable, lr=config.learning_rate)
+        trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        lr, m = config.learning_rate, config.diffusion_lr_multiplier
+        if config.use_diffusion_trajectory and m != 1.0:
+            diff_p, rest_p = [], []
+            for n, p in trainable:
+                b = n[7:] if n.startswith("module.") else n
+                (diff_p if b.startswith("traj_diffusion") else rest_p).append(p)
+            self.optimizer = (
+                torch.optim.AdamW(
+                    [{"params": diff_p, "lr": lr * m}, {"params": rest_p, "lr": lr}]
+                )
+                if diff_p
+                else torch.optim.AdamW([p for _, p in trainable], lr=lr)
+            )
+        else:
+            self.optimizer = torch.optim.AdamW([p for _, p in trainable], lr=lr)
+        print(
+            "  Optimizer LR(s):",
+            [f"{g['lr']:.2e}" for g in self.optimizer.param_groups],
+            "— [traj_diffusion, rest]" if len(self.optimizer.param_groups) > 1 else "",
+        )
         self.scheduler = None  # Will be set in train()
         
         # Mixed precision
@@ -1683,10 +1768,12 @@ class CoVLATrainerPaper:
         """Visualize a training sample (first item in batch)."""
         import matplotlib.pyplot as plt
         
-        # Clear previous visualization only, then reprint epoch summaries
+        # Clear previous visualization only, then reprint epoch summaries.
+        # Skip clear when diffusion_debug_forward: clear_output wipes earlier [diffusion] prints in the cell.
         try:
             from IPython.display import clear_output
-            clear_output(wait=True)
+            if not getattr(self.model.config, "diffusion_debug_forward", False):
+                clear_output(wait=True)
             
             # Reprint training info and epoch summaries
             if hasattr(self, '_training_info'):
@@ -1986,8 +2073,9 @@ class CoVLATrainerPaper:
                 shuffle=False,
             )
         
-        # Cosine annealing LR scheduler (decays LR from initial to 1/3 of initial)
-        eta_min = self.config.learning_rate / 3
+        # Two LR groups: shared eta_min would equalize floors; use 0 to keep diffusion/base ratio.
+        m = self.config.diffusion_lr_multiplier
+        eta_min = 0.0 if (self.config.use_diffusion_trajectory and m != 1.0) else self.config.learning_rate / 3
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=num_epochs, eta_min=eta_min
         )
@@ -2012,7 +2100,12 @@ class CoVLATrainerPaper:
             f"Val samples: {len(val_dataset)}" if val_dataset else None,
             f"Epochs: {num_epochs}",
             f"Batch size: {self.config.batch_size}",
-            f"Learning rate: {self.config.learning_rate} → {self.config.learning_rate/3:.1e} (cosine decay)",
+            f"Learning rate: {self.config.learning_rate} → {self.config.learning_rate/3:.1e} (cosine)"
+            + (
+                f", traj_diffusion lr={self.config.learning_rate * self.config.diffusion_lr_multiplier:.1e}"
+                if self.config.use_diffusion_trajectory and self.config.diffusion_lr_multiplier != 1.0
+                else ""
+            ),
             f"Loss weights: caption={self.config.caption_weight}, trajectory={self.config.trajectory_weight}",
             dist_line,
             "=" * 70,
