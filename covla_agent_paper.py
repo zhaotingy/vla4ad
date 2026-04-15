@@ -632,7 +632,7 @@ def _extract_ddpm(a: torch.Tensor, t: torch.Tensor, x_shape: Tuple[int, ...]) ->
 
 class TrajectoryDiffusionHead(nn.Module):
     """
-    Minimal conditional DDPM on flattened trajectory (noise prediction).
+    Minimal conditional DDPM on flattened trajectory (x₀-prediction).
     Conditioning: pooled trajectory-query LLM states (mean over queries).
     """
 
@@ -678,8 +678,8 @@ class TrajectoryDiffusionHead(nn.Module):
             nn.Linear(hidden_dim, self.flat_dim),
         )
 
-    def _predict_eps(self, x_flat: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        """x_flat: (B, flat_dim), t: (B,) long, cond: (B, cond_dim)"""
+    def _predict_x0(self, x_flat: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """x_flat: (B, flat_dim), t: (B,) long, cond: (B, cond_dim). Returns x0 prediction (normalized)."""
         te = self.time_embed(t)
         c = self.cond_proj(cond)
         h = torch.cat([x_flat, c, te], dim=-1)
@@ -704,53 +704,20 @@ class TrajectoryDiffusionHead(nn.Module):
         sqrt_acp = _extract_ddpm(self.sqrt_acp, t, x0.shape)
         sqrt_om = _extract_ddpm(self.sqrt_one_minus_acp, t, x0.shape)
         x_t = sqrt_acp * x0 + sqrt_om * noise
-        eps_pred = self._predict_eps(x_t, t, cond.float())
-        x0_hat_flat = (x_t - sqrt_om * eps_pred) / (sqrt_acp + 1e-8)
+        x0_hat_flat = self._predict_x0(x_t, t, cond.float())
+        eps_pred = (x_t - sqrt_acp * x0_hat_flat) / (sqrt_om + 1e-8)
 
-        _DBG_EVERY = 100
-        if debug_forward and train_step is not None and train_step % _DBG_EVERY == 0:
-            i = 0  # one example in the batch
-            ti = t[i].item()
-            sa_i = sqrt_acp[i, 0].item()
-            so_i = sqrt_om[i, 0].item()
-            x0_i, ni, xt_i = x0[i], noise[i], x_t[i]
-            ep_i, xh_i = eps_pred[i], x0_hat_flat[i]
-
-            # Waypoints 0, 3, 6, 9 (every 3 indices, up to 10 points)
-            def _wp_rows_stride(flat: torch.Tensor) -> str:
-                m = flat.view(self.num_points, self.coord_dim).detach().cpu().numpy()
-                n = min(self.num_points, 10)
-                lines = []
-                for wp in range(0, n, 3):
-                    lines.append(
-                        f"    wp{wp}: [{m[wp, 0]: .5f}, {m[wp, 1]: .5f}, {m[wp, 2]: .5f}]"
-                    )
-                return "\n".join(lines)
-
-            print(
-                f"[diffusion] global_step={train_step} example=0 t={ti} | "
-                f"sqrt_acp={sa_i:.6f} sqrt_om={so_i:.6f}"
-            )
-            print("  x0(norm) waypoints 0,3,6,9 (x, y, z):")
-            print(_wp_rows_stride(x0[i]))
-            print("  noise (same indices):")
-            print(_wp_rows_stride(noise[i]))
-            print("  x_t:")
-            print(_wp_rows_stride(x_t[i]))
-            print("  eps_pred:")
-            print(_wp_rows_stride(eps_pred[i]))
-            print("  x0_hat(norm) from ε_pred (same scale as x0):")
-            print(_wp_rows_stride(x0_hat_flat[i]))
-            print(
-                f"  flat stats — x0 μ/σ/min/max={x0_i.mean().item():.4f}/{x0_i.std().item():.4f}/"
-                f"{x0_i.min().item():.4f}/{x0_i.max().item():.4f} | "
-                f"noise μ/σ={ni.mean().item():.4f}/{ni.std().item():.4f} | "
-                f"x_t μ/σ={xt_i.mean().item():.4f}/{xt_i.std().item():.4f} | "
-                f"eps_pred μ/σ={ep_i.mean().item():.4f}/{ep_i.std().item():.4f} | "
-                f"x0_hat(norm) μ/σ={xh_i.mean().item():.4f}/{xh_i.std().item():.4f}"
-            )
-        loss = F.mse_loss(eps_pred, noise)
-        mse_per = ((eps_pred - noise) ** 2).mean(dim=1).detach()  # (B,) for bin logging
+        i = 0
+        x0_wp = x0[i].view(self.num_points, self.coord_dim).detach().cpu()
+        xh_wp = x0_hat_flat[i].view(self.num_points, self.coord_dim).detach().cpu()
+        def _fmt_wp(wp): return f"[{wp[0]:.3f},{wp[1]:.3f},{wp[2]:.3f}]"
+        wps = [0, 4, 9] if self.num_points >= 10 else [0, self.num_points - 1]
+        lines = [f"[diffusion] step={train_step} t={t[i].item()}"]
+        for w in wps:
+            lines.append(f"  wp{w}: gt={_fmt_wp(x0_wp[w])} pred={_fmt_wp(xh_wp[w])}")
+        self.last_debug_info = "\n".join(lines)
+        loss = F.mse_loss(x0_hat_flat, x0)
+        mse_per = ((x0_hat_flat - x0) ** 2).mean(dim=1).detach()  # (B,) for bin logging
         x0_hat = x0_hat_flat.view(B, self.num_points, self.coord_dim) * self.traj_scale
         return loss, x0_hat, t, mse_per
 
@@ -764,9 +731,11 @@ class TrajectoryDiffusionHead(nn.Module):
         cond_f = cond.float()
         for ti in reversed(range(self.num_timesteps)):
             t = torch.full((B,), ti, device=device, dtype=torch.long)
-            eps = self._predict_eps(x, t, cond_f)
-            beta_t = _extract_ddpm(self.betas, t, x.shape)
+            x0_pred = self._predict_x0(x, t, cond_f)
+            sqrt_acp = _extract_ddpm(self.sqrt_acp, t, x.shape)
             sqrt_om_ab = _extract_ddpm(self.sqrt_one_minus_acp, t, x.shape)
+            eps = (x - sqrt_acp * x0_pred) / (sqrt_om_ab + 1e-8)
+            beta_t = _extract_ddpm(self.betas, t, x.shape)
             sr = _extract_ddpm(self.sqrt_recip_alphas, t, x.shape)
             mean = sr * (x - beta_t / sqrt_om_ab * eps)
             if ti > 0:
@@ -1815,6 +1784,8 @@ class CoVLATrainerPaper:
                 nav_cmd_idx=nav_cmd_idx,
             )
         pred_traj = eval_output['pred_trajectory'][0].cpu().numpy()
+        if self.model.config.use_diffusion_trajectory and hasattr(self.model.traj_diffusion, 'last_debug_info'):
+            print(self.model.traj_diffusion.last_debug_info)
         # Diffusion: optional extra full sample() curves (same cond); Pred(x0_hat) is always above
         sample_trajs = []
         if self.model.config.use_diffusion_trajectory:
@@ -2166,10 +2137,8 @@ class CoVLATrainerPaper:
                 else:
                     print(f"      R2: (skipped — runs from epoch {self.config.eval_r2_from_epoch}+ and on final epoch)")
                 if self.config.use_diffusion_trajectory:
-                    bm = train_metrics.get('diffusion_bin_mse', [])
-                    if bm:
-                        parts = [f"{x:.4f}" if x == x else "nan" for x in bm]
-                        print(f"      diff ε-MSE by t-bin (low t → high t): [{', '.join(parts)}]")
+                    if hasattr(self.model.traj_diffusion, 'last_debug_info'):
+                        print(f"      {self.model.traj_diffusion.last_debug_info}")
                 
                 # Save best model
                 if val_metrics['ade'] < best_ade:
