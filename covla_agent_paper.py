@@ -262,6 +262,10 @@ class CoVLAConfig:
     diffusion_lr_multiplier: float = 1.0
     # If True, print example 0 every 100 optimizer steps (uses model.global_step; interval hardcoded in head).
     diffusion_debug_forward: bool = False
+    # Classifier-free guidance: randomly drop conditioning during training to enable diverse sampling.
+    diffusion_cfg_dropout: float = 0.1  # probability of zeroing cond during training (0 = disabled)
+    diffusion_cfg_scale: float = 1.0    # guidance scale for main prediction / evaluate() (1.0 = best ADE)
+    diffusion_cfg_fan_scale: float = 0.7  # guidance scale for fan samples in generate_eval_images (<1.0 = more diversity)
     
     @property
     def vision_encoder(self) -> str:
@@ -645,6 +649,7 @@ class TrajectoryDiffusionHead(nn.Module):
         hidden_dim: int,
         cond_proj_dim: int,
         traj_scale: float,
+        cfg_dropout_prob: float = 0.0,
     ):
         super().__init__()
         self.num_points = num_points
@@ -652,6 +657,7 @@ class TrajectoryDiffusionHead(nn.Module):
         self.flat_dim = num_points * coord_dim
         self.num_timesteps = num_timesteps
         self.traj_scale = traj_scale
+        self.cfg_dropout_prob = cfg_dropout_prob
 
         betas = torch.linspace(1e-4, 0.02, num_timesteps)
         alphas = 1.0 - betas
@@ -704,7 +710,11 @@ class TrajectoryDiffusionHead(nn.Module):
         sqrt_acp = _extract_ddpm(self.sqrt_acp, t, x0.shape)
         sqrt_om = _extract_ddpm(self.sqrt_one_minus_acp, t, x0.shape)
         x_t = sqrt_acp * x0 + sqrt_om * noise
-        x0_hat_flat = self._predict_x0(x_t, t, cond.float())
+        cond_f = cond.float()
+        if self.training and self.cfg_dropout_prob > 0:
+            mask = (torch.rand(B, 1, device=device) >= self.cfg_dropout_prob).float()
+            cond_f = cond_f * mask
+        x0_hat_flat = self._predict_x0(x_t, t, cond_f)
         eps_pred = (x_t - sqrt_acp * x0_hat_flat) / (sqrt_om + 1e-8)
 
         i = 0
@@ -722,16 +732,23 @@ class TrajectoryDiffusionHead(nn.Module):
         return loss, x0_hat, t, mse_per
 
     @torch.no_grad()
-    def sample(self, cond: torch.Tensor) -> torch.Tensor:
-        """DDPM reverse; cond: (B, cond_dim). Returns (B, P, 3) physical units."""
+    def sample(self, cond: torch.Tensor, cfg_scale: Optional[float] = None) -> torch.Tensor:
+        """DDPM reverse with optional classifier-free guidance.
+        cond: (B, cond_dim). cfg_scale: guidance weight (None = no CFG).
+        Returns (B, P, 3) physical units."""
         self.eval()
         device = cond.device
         B = cond.shape[0]
         x = torch.randn(B, self.flat_dim, device=device, dtype=torch.float32)
         cond_f = cond.float()
+        use_cfg = cfg_scale is not None and cfg_scale != 1.0 and self.cfg_dropout_prob > 0
+        cond_uncond = torch.zeros_like(cond_f) if use_cfg else None
         for ti in reversed(range(self.num_timesteps)):
             t = torch.full((B,), ti, device=device, dtype=torch.long)
             x0_pred = self._predict_x0(x, t, cond_f)
+            if use_cfg:
+                x0_uncond = self._predict_x0(x, t, cond_uncond)
+                x0_pred = x0_uncond + cfg_scale * (x0_pred - x0_uncond)
             sqrt_acp = _extract_ddpm(self.sqrt_acp, t, x.shape)
             sqrt_om_ab = _extract_ddpm(self.sqrt_one_minus_acp, t, x.shape)
             eps = (x - sqrt_acp * x0_pred) / (sqrt_om_ab + 1e-8)
@@ -858,6 +875,7 @@ class CoVLAAgentPaper(nn.Module):
                 hidden_dim=config.diffusion_hidden_dim,
                 cond_proj_dim=config.diffusion_cond_dim,
                 traj_scale=config.diffusion_traj_scale,
+                cfg_dropout_prob=config.diffusion_cfg_dropout,
             )
             self.trajectory_mlp = None
         else:
@@ -893,7 +911,10 @@ class CoVLAAgentPaper(nn.Module):
         if self.use_diffusion_trajectory:
             print(
                 f"  Trajectory: diffusion DDPM (T={config.diffusion_num_timesteps}, "
-                f"scale={config.diffusion_traj_scale})"
+                f"scale={config.diffusion_traj_scale}, "
+                f"CFG drop={config.diffusion_cfg_dropout}, "
+                f"CFG eval={config.diffusion_cfg_scale}, "
+                f"CFG fan={config.diffusion_cfg_fan_scale})"
             )
         else:
             print("  Trajectory: MLP (paper)")
@@ -1205,7 +1226,7 @@ class CoVLAAgentPaper(nn.Module):
                 result_diffusion['diffusion_t'] = t_b.detach()
                 result_diffusion['diffusion_mse_per'] = mse_per
             else:
-                pred_trajectory = self.traj_diffusion.sample(cond)
+                pred_trajectory = self.traj_diffusion.sample(cond, cfg_scale=self.config.diffusion_cfg_scale)
         else:
             pred_trajectory = self.trajectory_mlp(traj_q)
             if trajectories is not None:
@@ -1793,7 +1814,7 @@ class CoVLATrainerPaper:
             dc = eval_output["diffusion_cond"]
             n_s = max(0, int(self.model.config.diffusion_viz_num_samples))
             for _ in range(n_s):
-                sample_trajs.append(self.model.traj_diffusion.sample(dc).cpu().numpy()[0])
+                sample_trajs.append(self.model.traj_diffusion.sample(dc, cfg_scale=self.model.config.diffusion_cfg_fan_scale).cpu().numpy()[0])
         else:
             cmap = None
         caption = batch['caption'][0] if isinstance(batch['caption'], list) else batch['caption']
@@ -2682,9 +2703,10 @@ def visualize(
     fan_trajs = []
     if k_fan > 0 and r.get("diffusion_cond") is not None and getattr(model, "traj_diffusion", None) is not None:
         dc = r["diffusion_cond"]
+        cfg_s = getattr(model.config, "diffusion_cfg_fan_scale", 0.7)
         with torch.no_grad():
             for _ in range(k_fan):
-                fan_trajs.append(model.traj_diffusion.sample(dc).cpu().numpy()[0])
+                fan_trajs.append(model.traj_diffusion.sample(dc, cfg_scale=cfg_s).cpu().numpy()[0])
     cmap = plt.cm.tab10
     
     # Get physics trajectory from prediction result
@@ -2791,7 +2813,7 @@ def generate_eval_images(
     
     use_d = getattr(model.config, "use_diffusion_trajectory", False)
     if diffusion_fan_k is None:
-        k_fan = getattr(model.config, "diffusion_eval_num_samples", 8) if use_d else 0
+        k_fan = getattr(model.config, "diffusion_eval_num_samples", 4) if use_d else 0
     else:
         k_fan = int(diffusion_fan_k) if use_d else 0
     
@@ -2799,7 +2821,7 @@ def generate_eval_images(
     metrics = []
     saved_images = []
     
-    for i in tqdm(range(start_idx, end_idx), desc="Processing", mininterval=60.0):
+    for i in tqdm(range(start_idx, end_idx), desc="Processing", mininterval=300.0):
         sample = dataset[i]
         r = _predict_sample(model, sample, caption_mode)
         metrics.append({'ade': r['ade'], 'fde': r['fde']})
@@ -2807,9 +2829,10 @@ def generate_eval_images(
         fan_trajs = []
         if k_fan > 0 and r.get("diffusion_cond") is not None and getattr(model, "traj_diffusion", None) is not None:
             dc = r["diffusion_cond"]
+            cfg_s = getattr(model.config, "diffusion_cfg_fan_scale", 0.7)
             with torch.no_grad():
                 for _ in range(k_fan):
-                    fan_trajs.append(model.traj_diffusion.sample(dc).cpu().numpy()[0])
+                    fan_trajs.append(model.traj_diffusion.sample(dc, cfg_scale=cfg_s).cpu().numpy()[0])
         
         # Get GT caption from sample
         gt_caption = sample.get('caption', 'N/A')
