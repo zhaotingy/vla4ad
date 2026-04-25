@@ -28,6 +28,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from PIL import Image
 import numpy as np
+import math
 import json
 import os
 # =============================================================================
@@ -659,7 +660,13 @@ class TrajectoryDiffusionHead(nn.Module):
         self.traj_scale = traj_scale
         self.cfg_dropout_prob = cfg_dropout_prob
 
-        betas = torch.linspace(1e-4, 0.02, num_timesteps)
+        # Cosine schedule (Nichol & Dhariwal 2021) — guarantees ᾱ_T ≈ 0 for any T
+        s = 0.008
+        steps = torch.linspace(0, num_timesteps, num_timesteps + 1)
+        f = torch.cos((steps / num_timesteps + s) / (1 + s) * (math.pi / 2)) ** 2
+        alphas_cumprod_full = f / f[0]
+        betas = 1 - (alphas_cumprod_full[1:] / alphas_cumprod_full[:-1])
+        betas = betas.clamp(max=0.999)
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         self.register_buffer("betas", betas)
