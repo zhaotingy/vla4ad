@@ -252,7 +252,9 @@ class CoVLAConfig:
     diffusion_num_timesteps: int = 50
     diffusion_hidden_dim: int = 256
     diffusion_cond_dim: int = 256  # projected from LLM dim for the noise MLP
-    diffusion_traj_scale: float = 25.0  # divide coords by this before diffusion (rough meter scale)
+    # Scale to normalize trajectory before diffusion. Either a single float (uniform) or
+    # a tuple/list of 3 floats (forward, lateral, height) for per-dimension normalization.
+    diffusion_traj_scale: tuple = (20.0, 2.0, 0.5)
     diffusion_loss_bins: int = 5  # log noise MSE averaged over t bins (train)
     diffusion_eval_num_samples: int = 8  # default K for eval image fan (set generate_eval_images diffusion_fan_k)
     diffusion_viz_num_samples: int = 1  # training viz (diffusion): N independent sample() curves + always Pred(x0_hat); N=0 → x0_hat only
@@ -649,7 +651,7 @@ class TrajectoryDiffusionHead(nn.Module):
         num_timesteps: int,
         hidden_dim: int,
         cond_proj_dim: int,
-        traj_scale: float,
+        traj_scale,  # float | tuple/list of coord_dim floats
         cfg_dropout_prob: float = 0.0,
     ):
         super().__init__()
@@ -657,8 +659,13 @@ class TrajectoryDiffusionHead(nn.Module):
         self.coord_dim = coord_dim
         self.flat_dim = num_points * coord_dim
         self.num_timesteps = num_timesteps
-        self.traj_scale = traj_scale
         self.cfg_dropout_prob = cfg_dropout_prob
+        if isinstance(traj_scale, (tuple, list)):
+            assert len(traj_scale) == coord_dim, f"traj_scale must have {coord_dim} elements"
+            scale_tensor = torch.tensor(traj_scale, dtype=torch.float32).view(1, 1, coord_dim)
+        else:
+            scale_tensor = torch.full((1, 1, coord_dim), float(traj_scale), dtype=torch.float32)
+        self.register_buffer("traj_scale", scale_tensor)
 
         # Cosine schedule (Nichol & Dhariwal 2021) — guarantees ᾱ_T ≈ 0 for any T
         s = 0.008
@@ -704,14 +711,14 @@ class TrajectoryDiffusionHead(nn.Module):
         cond: torch.Tensor,
         debug_forward: bool = False,
         train_step: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         x0_phys: (B, P, 3) in dataset units.
-        Returns (loss, x0_hat, t, mse_per) — diffusion loss on noise, and x0_hat (B, P, 3) for metrics.
+        Returns (loss, x0_hat, t, mse_per, x_t_phys) — x_t_phys is the noisy input at sampled t.
         """
         device = x0_phys.device
         B = x0_phys.shape[0]
-        x0 = (x0_phys.reshape(B, -1) / self.traj_scale).float()
+        x0 = (x0_phys / self.traj_scale).reshape(B, -1).float()
         t = torch.randint(0, self.num_timesteps, (B,), device=device, dtype=torch.long)
         noise = torch.randn_like(x0)
         sqrt_acp = _extract_ddpm(self.sqrt_acp, t, x0.shape)
@@ -733,10 +740,11 @@ class TrajectoryDiffusionHead(nn.Module):
         for w in wps:
             lines.append(f"  wp{w}: gt={_fmt_wp(x0_wp[w])} pred={_fmt_wp(xh_wp[w])}")
         self.last_debug_info = "\n".join(lines)
-        loss = F.mse_loss(x0_hat_flat, x0)
-        mse_per = ((x0_hat_flat - x0) ** 2).mean(dim=1).detach()  # (B,) for bin logging
         x0_hat = x0_hat_flat.view(B, self.num_points, self.coord_dim) * self.traj_scale
-        return loss, x0_hat, t, mse_per
+        x_t_phys = (x_t.view(B, self.num_points, self.coord_dim) * self.traj_scale).detach()
+        loss = F.mse_loss(x0_hat, x0_phys)
+        mse_per = ((x0_hat - x0_phys) ** 2).mean(dim=(1, 2)).detach()  # (B,) for bin logging
+        return loss, x0_hat, t, mse_per, x_t_phys
 
     @torch.no_grad()
     def sample(self, cond: torch.Tensor, cfg_scale: Optional[float] = None) -> torch.Tensor:
@@ -1218,7 +1226,7 @@ class CoVLAAgentPaper(nn.Module):
             cond = traj_q.mean(dim=1)  # (batch, llm_dim)
             result_diffusion = {'diffusion_cond': cond}
             if trajectories is not None:
-                trajectory_loss, pred_trajectory, t_b, mse_per = (
+                trajectory_loss, pred_trajectory, t_b, mse_per, x_t_phys = (
                     self.traj_diffusion.training_loss_and_x0_hat(
                         trajectories,
                         cond,
@@ -1232,6 +1240,7 @@ class CoVLAAgentPaper(nn.Module):
                     )
                 result_diffusion['diffusion_t'] = t_b.detach()
                 result_diffusion['diffusion_mse_per'] = mse_per
+                result_diffusion['diffusion_x_t'] = x_t_phys
             else:
                 pred_trajectory = self.traj_diffusion.sample(cond, cfg_scale=self.config.diffusion_cfg_scale)
         else:
@@ -1740,7 +1749,7 @@ class CoVLATrainerPaper:
                         diff_bin_cnt[bi] += int(m.sum().item())
             
             # Visualize every 500 steps
-            if global_step % 250 == 0:
+            if global_step % 50 == 0:
                 self._visualize_training_sample(batch, output, global_step)
         
         self._global_step = global_step
@@ -1873,6 +1882,7 @@ class CoVLATrainerPaper:
         traj_physics = batch['trajectory_physics'][0].cpu().numpy()
         
         # Create figure: 3 panels [First Frame | Current Frame | Bird's Eye View]
+        has_diff_viz = self.model.config.use_diffusion_trajectory and output.get('diffusion_t') is not None
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         
         # Left: First frame (t-1s)
@@ -1880,6 +1890,18 @@ class CoVLATrainerPaper:
         ax1.imshow(first_frame)
         ax1.set_title(f"First Frame (t-1s)")
         ax1.axis('off')
+        
+        # Use actual x_t from training forward pass
+        x_t_viz = None
+        diff_title_extra = ""
+        if has_diff_viz:
+            diff = self.model.traj_diffusion
+            sqrt_acp_arr = diff.sqrt_acp.cpu().numpy()
+            sqrt_om_arr = diff.sqrt_one_minus_acp.cpu().numpy()
+            diff_ti = int(output['diffusion_t'][0].item())
+            s_w, n_w = sqrt_acp_arr[diff_ti], sqrt_om_arr[diff_ti]
+            x_t_viz = output['diffusion_x_t'][0].cpu().numpy()
+            diff_title_extra = f" | t={diff_ti}/{diff.num_timesteps} sig={s_w:.2f} noise={n_w:.2f} ᾱT={sqrt_acp_arr[-1]**2:.3f}"
         
         # Middle: Current frame with trajectory
         ax2 = axes[1]
@@ -1902,6 +1924,8 @@ class CoVLATrainerPaper:
                 last_frame, teacher_traj, extrinsic, intrinsic, color='darkorange', label='Teacher', ax=ax2, imshow_frame=False
             )
         plot_trajectory_on_image(last_frame, traj_physics, extrinsic, intrinsic, color='blue', label='Physics', ax=ax2, imshow_frame=False)
+        if x_t_viz is not None:
+            plot_trajectory_on_image(last_frame, x_t_viz, extrinsic, intrinsic, color='orange', linestyle=':', label=f'x_t (t={diff_ti})', ax=ax2, imshow_frame=False)
         ax2.legend(loc='upper right')
         samp_note = f" | ADE_s {ade_s:.2f}m" if ade_s is not None else ""
         ax2.set_title(f"Current Frame | Nav: {nav_cmd} | ADE {ade:.2f}m | FDE {fde:.2f}m | {ego['vEgo']:.1f} m/s{samp_note}")
@@ -1926,6 +1950,8 @@ class CoVLATrainerPaper:
             ax3.plot(sample_trajs[0][:, 0], sample_trajs[0][:, 1], '--', color='magenta', linewidth=2, markersize=4, label='Pred (sample)')
             for j, st in enumerate(sample_trajs[1:], start=1):
                 ax3.plot(st[:, 0], st[:, 1], '-', color=cmap((j % 10) / 9.0), linewidth=1.2, alpha=0.85)
+        if x_t_viz is not None:
+            ax3.plot(x_t_viz[:, 0], x_t_viz[:, 1], ':', color='orange', marker='x', markersize=4, linewidth=1.5, label=f'x_t (t={diff_ti})')
         ax3.scatter([0], [0], c='blue', s=100, marker='*', label='Ego', zorder=5)
         ax3.set_xlabel('Forward (m)')
         ax3.set_ylabel('Lateral (m)')
@@ -1933,7 +1959,7 @@ class CoVLATrainerPaper:
         ax3.grid(True, alpha=0.3)
         ax3.set_aspect('equal')
         bev_note = f" | +{len(sample_trajs)} sample()" if sample_trajs else ""
-        ax3.set_title(f"Bird's Eye View{bev_note}")
+        ax3.set_title(f"Bird's Eye View{bev_note}{diff_title_extra}")
         
         plt.suptitle(f"Step {step}", fontsize=12, fontweight='bold')
         plt.tight_layout()
